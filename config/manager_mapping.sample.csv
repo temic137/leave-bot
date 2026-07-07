@@ -1,0 +1,6 @@
+employee_email,manager_email,role,department
+ada@example.com,james@example.com,employee,Sales
+bayo@example.com,james@example.com,employee,Sales
+chioma@example.com,james@example.com,employee,Operations
+daniel@example.com,james@example.com,employee,Finance
+james@example.com,,manager,Sales

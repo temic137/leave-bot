@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Leave Bot Prototype</title>
+    <style>
+      :root {
+        --bg: #eef2f6;
+        --panel: #ffffff;
+        --text: #17202a;
+        --muted: #667085;
+        --line: #d8dee8;
+        --accent: #0f766e;
+        --accent-dark: #0b5c55;
+        --danger: #b42318;
+        --warn: #8a6100;
+        --ok: #137a3f;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: Arial, Helvetica, sans-serif;
+      }
+
+      header {
+        background: var(--panel);
+        border-bottom: 1px solid var(--line);
+        padding: 16px 22px;
+      }
+
+      h1 {
+        font-size: 22px;
+        letter-spacing: 0;
+        margin: 0;
+      }
+
+      h2 {
+        font-size: 16px;
+        margin: 0 0 12px;
+      }
+
+      main {
+        display: grid;
+        grid-template-columns: minmax(360px, 520px) 1fr;
+        gap: 16px;
+        padding: 16px;
+      }
+
+      section {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 14px;
+      }
+
+      label {
+        color: var(--muted);
+        display: block;
+        font-size: 13px;
+        margin: 10px 0 6px;
+      }
+
+      select,
+      textarea,
+      input {
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        color: var(--text);
+        font: inherit;
+        padding: 10px;
+        width: 100%;
+      }
+
+      button {
+        background: var(--accent);
+        border: 0;
+        border-radius: 6px;
+        color: white;
+        cursor: pointer;
+        font: inherit;
+        min-height: 38px;
+        padding: 9px 12px;
+      }
+
+      button:hover {
+        background: var(--accent-dark);
+      }
+
+      button.secondary {
+        background: #334155;
+      }
+
+      button.danger {
+        background: var(--danger);
+      }
+
+      .stack {
+        display: grid;
+        gap: 16px;
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      .small,
+      .meta {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .chat {
+        background: #f8fafc;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        display: grid;
+        gap: 10px;
+        height: 420px;
+        overflow: auto;
+        padding: 12px;
+      }
+
+      .bubble {
+        border-radius: 8px;
+        max-width: 92%;
+        padding: 10px 12px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .user {
+        justify-self: end;
+        background: #d9f99d;
+      }
+
+      .bot {
+        justify-self: start;
+        background: white;
+        border: 1px solid var(--line);
+      }
+
+      .policy-editor {
+        min-height: 360px;
+        resize: vertical;
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      .item {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 10px;
+      }
+
+      .list {
+        display: grid;
+        gap: 10px;
+      }
+
+      .pill {
+        background: #e8eef3;
+        border-radius: 999px;
+        color: #243444;
+        display: inline-block;
+        font-size: 12px;
+        padding: 4px 8px;
+      }
+
+      .pill.pending_manager,
+      .pill.pending_hr {
+        background: #fff4cf;
+        color: var(--warn);
+      }
+
+      .pill.approved {
+        background: #dcfce7;
+        color: var(--ok);
+      }
+
+      .pill.rejected {
+        background: #fee4e2;
+        color: var(--danger);
+      }
+
+      pre {
+        background: #111827;
+        border-radius: 8px;
+        color: #e5e7eb;
+        max-height: 220px;
+        overflow: auto;
+        padding: 10px;
+        white-space: pre-wrap;
+      }
+
+      @media (max-width: 980px) {
+        main {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Leave Bot Prototype</h1>
+      <div class="small">Chat-first simulator for the Slack leave bot.</div>
+    </header>
+
+    <main>
+      <div class="stack">
+        <section>
+          <h2>Setup</h2>
+          <div class="actions">
+            <button id="setup">Setup demo data</button>
+            <button id="reset" class="danger">Reset demo</button>
+            <button id="refresh" class="secondary">Refresh</button>
+          </div>
+          <div id="status" class="small"></div>
+        </section>
+
+        <section>
+          <h2>Slack Message Simulator</h2>
+          <label for="actor">Slack user</label>
+          <select id="actor"></select>
+
+          <div id="chat" class="chat"></div>
+
+          <label for="message">Message</label>
+          <textarea id="message" rows="3">I need annual leave from 2026-07-10 to 2026-07-12</textarea>
+
+          <label>
+            <input id="document" type="checkbox" style="width:auto" />
+            Attach demo document
+          </label>
+
+          <div class="actions">
+            <button id="send">Send message</button>
+            <button class="secondary" data-example="show my leave balance">My balance</button>
+            <button class="secondary" data-example="show Ada Example leave balance">Manager balance query</button>
+            <button class="secondary" data-example="I need sick leave from 2026-07-20 to 2026-07-21">Sick leave test</button>
+            <button class="secondary" data-example="approve request 1">Approve request</button>
+            <button class="secondary" data-example="reject request 1">Reject request</button>
+          </div>
+        </section>
+
+        <section>
+          <h2>Last API Response</h2>
+          <pre id="output">{}</pre>
+        </section>
+      </div>
+
+      <div class="stack">
+        <section>
+          <h2>Admin Policy Text Editor</h2>
+          <div class="small">Edit this like a document. Example: Sick Leave: 10 days maximum. Document required. Manager approval only.</div>
+          <textarea id="policy-text" class="policy-editor"></textarea>
+          <div class="actions">
+            <button id="save-policy">Save policy text</button>
+            <button id="reload-policy" class="secondary">Reload policy text</button>
+          </div>
+        </section>
+
+        <section>
+          <h2>Admin People</h2>
+          <label for="person-name">Name</label>
+          <input id="person-name" placeholder="New Employee" />
+
+          <label for="person-email">Email</label>
+          <input id="person-email" placeholder="new.employee@example.com" />
+
+          <label for="person-slack">Slack user ID</label>
+          <input id="person-slack" placeholder="U_NEW_EMPLOYEE" />
+
+          <label for="person-role">Role</label>
+          <select id="person-role">
+            <option value="employee">employee</option>
+            <option value="manager">manager</option>
+            <option value="hr">hr</option>
+            <option value="admin">admin</option>
+          </select>
+
+          <label for="person-manager">Manager</label>
+          <select id="person-manager"></select>
+
+          <label for="person-department">Department</label>
+          <input id="person-department" placeholder="Sales" />
+
+          <div class="actions">
+            <button id="save-person">Save person</button>
+          </div>
+        </section>
+
+        <section>
+          <h2>Slack Directory</h2>
+          <div class="small">Use this to find the Slack user IDs for you and your manager.</div>
+          <label for="slack-search">Search</label>
+          <input id="slack-search" placeholder="Type a name" />
+          <div class="actions">
+            <button id="load-slack-users" class="secondary">Load Slack users</button>
+          </div>
+          <div id="slack-users" class="list"></div>
+        </section>
+
+        <section>
+          <h2>Leave Requests</h2>
+          <div id="requests" class="list"></div>
+        </section>
+
+        <section>
+          <h2>Employees</h2>
+          <div id="employees" class="list"></div>
+        </section>
+      </div>
+    </main>
+
+    <script>
+      const state = { employees: [], requests: [], leaveTypes: {}, slackUsers: [] };
+      const $ = (id) => document.getElementById(id);
+
+      function setStatus(text) {
+        $("status").textContent = text;
+      }
+
+      function show(data) {
+        $("output").textContent = JSON.stringify(data, null, 2);
+      }
+
+      async function api(path, options = {}) {
+        const response = await fetch(path, {
+          headers: { "Content-Type": "application/json" },
+          ...options,
+        });
+        const data = await response.json();
+        if (!response.ok) throw data;
+        return data;
+      }
+
+      function addBubble(kind, text) {
+        const bubble = document.createElement("div");
+        bubble.className = `bubble ${kind}`;
+        bubble.textContent = text;
+        $("chat").appendChild(bubble);
+        $("chat").scrollTop = $("chat").scrollHeight;
+      }
+
+      async function setup() {
+        const data = await api("/prototype/setup", { method: "POST" });
+        show(data);
+        setStatus("Demo data is ready.");
+        await loadPolicyText();
+        await loadState();
+      }
+
+      async function reset() {
+        const data = await api("/prototype/reset", { method: "POST" });
+        $("chat").innerHTML = "";
+        addBubble("bot", "Demo reset. You can apply for leave or ask for leave balance.");
+        show(data);
+        setStatus("Demo data reset.");
+        await loadState();
+      }
+
+      async function loadState() {
+        const data = await api("/prototype/state");
+        state.employees = data.employees;
+        state.requests = data.requests;
+        state.leaveTypes = data.leave_types;
+        renderActors();
+        renderManagerOptions();
+        renderEmployees();
+        renderRequests();
+      }
+
+      async function loadPolicyText() {
+        const data = await api("/admin/leave-policy-text");
+        $("policy-text").value = data.text;
+      }
+
+      async function savePolicyText() {
+        const data = await api("/admin/leave-policy-text", {
+          method: "PUT",
+          body: JSON.stringify({ text: $("policy-text").value }),
+        });
+        show(data);
+        setStatus("Policy saved and reloaded.");
+        await loadState();
+      }
+
+      async function savePerson() {
+        const payload = {
+          name: $("person-name").value,
+          email: $("person-email").value,
+          slack_user_id: $("person-slack").value,
+          role: $("person-role").value,
+          manager_id: $("person-manager").value ? Number($("person-manager").value) : null,
+          department: $("person-department").value || null,
+        };
+        const data = await api("/admin/employees", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        show(data);
+        setStatus("Person saved.");
+        $("person-name").value = "";
+        $("person-email").value = "";
+        $("person-slack").value = "";
+        $("person-role").value = "employee";
+        $("person-manager").value = "";
+        $("person-department").value = "";
+        await loadState();
+      }
+
+      async function loadSlackUsers() {
+        state.slackUsers = await api("/admin/slack-users");
+        renderSlackUsers();
+      }
+
+      function renderActors() {
+        const selected = $("actor").value;
+        $("actor").innerHTML = state.employees
+          .map((employee) => `<option value="${employee.slack_user_id}">${employee.name} (${employee.role})</option>`)
+          .join("");
+        if (selected) $("actor").value = selected;
+      }
+
+      function renderManagerOptions() {
+        const selected = $("person-manager").value;
+        const managers = state.employees.filter((employee) => ["manager", "admin", "hr"].includes(employee.role));
+        $("person-manager").innerHTML = `<option value="">None</option>` + managers
+          .map((employee) => `<option value="${employee.id}">${employee.name}</option>`)
+          .join("");
+        if (selected) $("person-manager").value = selected;
+      }
+
+      function renderSlackUsers() {
+        const query = $("slack-search").value.trim().toLowerCase();
+        const users = state.slackUsers
+          .filter((user) => !query || user.name.toLowerCase().includes(query) || user.slack_user_id.toLowerCase().includes(query))
+          .slice(0, 30);
+        $("slack-users").innerHTML = users
+          .map((user) => `
+            <div class="item">
+              <strong>${user.name}</strong>
+              <div class="meta">${user.slack_user_id}${user.email ? " | " + user.email : ""}</div>
+            </div>
+          `)
+          .join("");
+      }
+
+      function renderEmployees() {
+        $("employees").innerHTML = state.employees
+          .map((employee) => {
+            const balances = Object.entries(employee.balances)
+              .map(([type, days]) => `${type}: ${days} taken`)
+              .join(" | ");
+            return `
+              <div class="item">
+                <strong>${employee.name}</strong> <span class="pill">${employee.role}</span>
+                <div class="meta">${employee.email} | Manager: ${employee.manager_name || "None"}</div>
+                <div class="meta">${balances}</div>
+              </div>
+            `;
+          })
+          .join("");
+      }
+
+      function renderRequests() {
+        if (!state.requests.length) {
+          $("requests").innerHTML = `<div class="item small">No leave requests yet.</div>`;
+          return;
+        }
+        $("requests").innerHTML = state.requests
+          .map((request) => {
+            const actions = request.status === "pending_manager"
+              ? `<button onclick="managerDecision(${request.id}, true)">Manager approve</button>
+                 <button class="danger" onclick="managerDecision(${request.id}, false)">Manager reject</button>`
+              : request.status === "pending_hr"
+                ? `<button onclick="hrDecision(${request.id}, true)">HR approve</button>
+                   <button class="danger" onclick="hrDecision(${request.id}, false)">HR reject</button>`
+                : "";
+            return `
+              <div class="item">
+                <strong>#${request.id} ${request.employee_name}</strong> <span class="pill ${request.status}">${request.status}</span>
+                <div class="meta">${request.leave_type} | ${request.start_date} to ${request.end_date} | ${request.days_requested} days</div>
+                <div class="meta">Document: ${request.document_key || "None"}</div>
+                <div class="actions">${actions}</div>
+              </div>
+            `;
+          })
+          .join("");
+      }
+
+      async function sendMessage() {
+        const text = $("message").value.trim();
+        if (!text) return;
+        addBubble("user", text);
+        const data = await api("/prototype/chat", {
+          method: "POST",
+          body: JSON.stringify({
+            slack_user_id: $("actor").value,
+            text,
+            document_key: $("document").checked ? "demo-document.pdf" : null,
+          }),
+        });
+        show(data);
+        addBubble("bot", data.reply);
+        $("message").value = "";
+        $("document").checked = false;
+        await loadState();
+      }
+
+      async function managerDecision(requestId, approved) {
+        const data = await api(`/requests/${requestId}/manager-decision`, {
+          method: "POST",
+          body: JSON.stringify({
+            approver_slack_user_id: "U_JAMES",
+            approved,
+            comment: approved ? "Approved in prototype" : "Rejected in prototype",
+          }),
+        });
+        show(data);
+        addBubble("bot", `Manager ${approved ? "approved" : "rejected"} request #${requestId}.`);
+        await loadState();
+      }
+
+      async function hrDecision(requestId, approved) {
+        const data = await api(`/requests/${requestId}/hr-decision`, {
+          method: "POST",
+          body: JSON.stringify({
+            approver_slack_user_id: "U_MINA",
+            approved,
+            comment: approved ? "HR approved in prototype" : "HR rejected in prototype",
+          }),
+        });
+        show(data);
+        addBubble("bot", `HR ${approved ? "approved" : "rejected"} request #${requestId}.`);
+        await loadState();
+      }
+
+      async function run(action) {
+        try {
+          await action();
+        } catch (error) {
+          show(error);
+          addBubble("bot", "That action failed. Check the API response panel.");
+          setStatus("Action failed.");
+        }
+      }
+
+      $("setup").addEventListener("click", () => run(setup));
+      $("reset").addEventListener("click", () => run(reset));
+      $("refresh").addEventListener("click", () => run(loadState));
+      $("send").addEventListener("click", () => run(sendMessage));
+      $("save-policy").addEventListener("click", () => run(savePolicyText));
+      $("reload-policy").addEventListener("click", () => run(loadPolicyText));
+      $("save-person").addEventListener("click", () => run(savePerson));
+      $("load-slack-users").addEventListener("click", () => run(loadSlackUsers));
+      $("slack-search").addEventListener("input", renderSlackUsers);
+      document.querySelectorAll("[data-example]").forEach((button) => {
+        button.addEventListener("click", () => {
+          $("message").value = button.dataset.example;
+        });
+      });
+
+      run(async () => {
+        await setup();
+        addBubble("bot", "Demo ready. Type a leave request or ask for leave balance.");
+      });
+    </script>
+  </body>
+</html>

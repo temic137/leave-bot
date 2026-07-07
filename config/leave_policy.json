@@ -1,0 +1,30 @@
+{
+  "annual": {
+    "display_name": "Annual Leave",
+    "annual_days": 20.0,
+    "requires_document": false,
+    "requires_hr": false,
+    "allow_negative_balance": false
+  },
+  "sick": {
+    "display_name": "Sick Leave",
+    "annual_days": 10,
+    "requires_document": true,
+    "requires_hr": false,
+    "allow_negative_balance": false
+  },
+  "maternity": {
+    "display_name": "Maternity Leave",
+    "annual_days": 90.0,
+    "requires_document": true,
+    "requires_hr": true,
+    "allow_negative_balance": true
+  },
+  "emergency": {
+    "display_name": "Emergency Leave",
+    "annual_days": 3.0,
+    "requires_document": false,
+    "requires_hr": false,
+    "allow_negative_balance": false
+  }
+}
