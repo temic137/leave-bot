@@ -186,6 +186,7 @@
             <button id="save-policy">Save policy text</button>
             <button id="reload-policy" class="secondary">Reload policy text</button>
           </div>
+          <div id="policy-versions" class="list" style="margin-top:12px"></div>
         </section>
 
         <section>
@@ -246,7 +247,7 @@
     </main>
 
     <script>
-      const state = { employees: [], requests: [], leaveTypes: {}, slackUsers: [] };
+      const state = { employees: [], requests: [], leaveTypes: {}, slackUsers: [], policyVersions: [] };
       const $ = (id) => document.getElementById(id);
 
       function setStatus(text) {
@@ -292,6 +293,13 @@
       async function loadPolicyText() {
         const data = await api("/admin/leave-policy-text");
         $("policy-text").value = data.text;
+        state.policyVersions = await api("/admin/leave-policy-versions");
+        $("policy-versions").innerHTML = state.policyVersions.slice(0, 5).map((version) => `
+          <div class="item">
+            <strong>Version ${version.version}</strong>
+            <div class="meta">${new Date(version.created_at).toLocaleString()} | ${version.created_by}</div>
+          </div>
+        `).join("");
       }
 
       async function savePolicyText() {
@@ -301,6 +309,7 @@
         });
         show(data);
         setStatus("Policy saved and reloaded.");
+        await loadPolicyText();
         await loadState();
       }
 
