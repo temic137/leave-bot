@@ -335,12 +335,24 @@
         $("output").textContent = JSON.stringify(data, null, 2);
       }
 
-      async function api(path, options = {}) {
+      async function api(path, options = {}, retried = false) {
+        const adminKey = sessionStorage.getItem("leaveBotAdminKey");
         const response = await fetch(path, {
-          headers: { "Content-Type": "application/json" },
           ...options,
+          headers: {
+            "Content-Type": "application/json",
+            ...(adminKey ? { "X-Admin-API-Key": adminKey } : {}),
+            ...(options.headers || {}),
+          },
         });
         const data = await response.json();
+        if (response.status === 401 && !retried) {
+          const key = window.prompt("Admin API key");
+          if (key) {
+            sessionStorage.setItem("leaveBotAdminKey", key);
+            return api(path, options, true);
+          }
+        }
         if (!response.ok) throw data;
         return data;
       }
