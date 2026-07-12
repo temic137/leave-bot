@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from sqlalchemy import Date, DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Date, DateTime, ForeignKey, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
@@ -103,28 +103,6 @@ class ConversationSession(Base):
     collected_fields_json: Mapped[str] = mapped_column(Text, default="{}")
     status: Mapped[str] = mapped_column(String(32), default="open")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now)
-
-
-class SlackSyncRun(Base):
-    __tablename__ = "slack_sync_runs"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    status: Mapped[str] = mapped_column(String(32))
-    users_seen: Mapped[int] = mapped_column(default=0)
-    users_upserted: Mapped[int] = mapped_column(default=0)
-    error: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
-
-
-class ManagerMapping(Base):
-    __tablename__ = "manager_mappings"
-    __table_args__ = (UniqueConstraint("employee_email"),)
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    employee_email: Mapped[str] = mapped_column(String(255), index=True)
-    manager_email: Mapped[str | None] = mapped_column(String(255))
-    role: Mapped[str] = mapped_column(String(32), default=EmployeeRole.employee.value)
-    department: Mapped[str | None] = mapped_column(String(128))
 
 
 class LeavePolicyVersion(Base):

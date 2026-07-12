@@ -47,6 +47,17 @@ def seed_people(db: Session) -> tuple[Employee, Employee, Employee]:
     return employee, manager, hr
 
 
+def test_database_schema_has_only_the_six_core_tables() -> None:
+    assert set(Base.metadata.tables) == {
+        "employees",
+        "leave_requests",
+        "leave_balance_ledger",
+        "approval_events",
+        "leave_policy_versions",
+        "conversation_sessions",
+    }
+
+
 def test_manager_can_view_direct_report_balance(db: Session) -> None:
     employee, manager, hr = seed_people(db)
 

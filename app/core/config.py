@@ -9,8 +9,6 @@ class Settings(BaseSettings):
     admin_api_key: str = ""
     database_url: str = "sqlite:///./leavebot.db"
     leave_policy_path: str = "config/leave_policy.json"
-    manager_mapping_csv: str = "config/manager_mapping.sample.csv"
-
     slack_bot_token: str = ""
     slack_signing_secret: str = ""
 

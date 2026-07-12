@@ -87,16 +87,6 @@ def list_real_slack_users() -> list[dict]:
     return RealSlackClient().list_user_directory()
 
 
-@router.post("/admin/manager-mapping/import")
-def import_manager_mapping(db: Session = Depends(get_db)) -> dict[str, int]:
-    create_all()
-    service = EmployeeSyncService(db)
-    imported = service.import_manager_mapping_csv(settings.manager_mapping_csv)
-    applied = service.apply_manager_mappings()
-    db.commit()
-    return {"rows_imported": imported, "employees_updated": applied}
-
-
 @router.post("/admin/balances/initialize")
 def initialize_balances(year: int | None = None, db: Session = Depends(get_db)) -> dict[str, int]:
     create_all()
