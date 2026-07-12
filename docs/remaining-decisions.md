@@ -109,7 +109,7 @@ Manager approval first. If policy requires HR, HR approval comes second.
 Current assumption:
 
 ```text
-Approved leave writes a negative entry into leave_balance_ledger.
+Approved leave updates the request status to `approved`. Days taken are calculated directly from approved `leave_requests`; there is no separate balance ledger.
 The employee view shows accumulated taken days only.
 ```
 
