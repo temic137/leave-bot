@@ -4,17 +4,19 @@ import hmac
 import json
 import re
 import time
+from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+import httpx
 from pydantic import BaseModel
-from sqlalchemy import delete, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.adapters.llm import MockMessageParser
-from app.adapters.slack import ConsoleSlackClient, RealSlackClient
+from app.adapters.llm import GroqMessageParser
+from app.adapters.slack import RealSlackClient
 from app.adapters.workflow import LocalApprovalWorkflow
 from app.core.config import settings
-from app.db.models import ApprovalEvent, ConversationSession, Employee, LeaveBalanceLedger, LeaveRequest, ManagerMapping, SlackSyncRun
+from app.db.models import ConversationSession, Employee, LeavePolicyVersion, LeaveRequest
 from app.db.session import create_all, get_db
 from app.schemas.leave import BalanceRead, LeaveRequestCreate, LeaveRequestRead, ParsedMessage
 from app.services.balances import BalanceService
@@ -25,12 +27,6 @@ from app.services.policy import leave_policy
 
 
 router = APIRouter()
-
-
-class MockMessageIn(BaseModel):
-    slack_user_id: str
-    text: str
-    document_key: str | None = None
 
 
 class DecisionIn(BaseModel):
@@ -67,36 +63,10 @@ class EmployeeIn(BaseModel):
     manager_id: int | None = None
 
 
-def _setup_demo_data(db: Session) -> None:
-    create_all()
-    sync = EmployeeSyncService(db)
-    slack = ConsoleSlackClient()
-    for user in slack.list_users():
-        sync.upsert_slack_user(user.slack_user_id, user.email, user.name, user.is_active)
-    sync.import_manager_mapping_csv(settings.manager_mapping_csv)
-    sync.apply_manager_mappings()
-    balances = BalanceService(db)
-    for employee in db.scalars(select(Employee)).all():
-        balances.initialize_default_balances(employee.id, date.today().year)
-
-
 @router.post("/admin/init-db")
 def init_db() -> dict[str, str]:
     create_all()
     return {"status": "created"}
-
-
-@router.post("/admin/sync/mock-slack")
-def sync_mock_slack(db: Session = Depends(get_db)) -> dict[str, int]:
-    create_all()
-    slack = ConsoleSlackClient()
-    service = EmployeeSyncService(db)
-    count = 0
-    for user in slack.list_users():
-        service.upsert_slack_user(user.slack_user_id, user.email, user.name, user.is_active)
-        count += 1
-    db.commit()
-    return {"users_upserted": count}
 
 
 @router.post("/admin/sync/slack")
@@ -179,7 +149,8 @@ def create_employee(payload: EmployeeIn, db: Session = Depends(get_db)) -> dict:
 
 
 @router.get("/admin/leave-types")
-def list_leave_types() -> dict:
+def list_leave_types(db: Session = Depends(get_db)) -> dict:
+    _sync_policy_from_db(db)
     return {
         key: {
             "key": key,
@@ -195,6 +166,7 @@ def list_leave_types() -> dict:
 
 @router.post("/admin/leave-types")
 def upsert_leave_type(payload: LeavePolicyIn, db: Session = Depends(get_db)) -> dict:
+    _sync_policy_from_db(db)
     try:
         rule = leave_policy.upsert(
             key=payload.key,
@@ -203,6 +175,7 @@ def upsert_leave_type(payload: LeavePolicyIn, db: Session = Depends(get_db)) -> 
             requires_document=payload.requires_document,
             requires_hr=payload.requires_hr,
             allow_negative_balance=payload.allow_negative_balance,
+            persist=False,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -211,6 +184,14 @@ def upsert_leave_type(payload: LeavePolicyIn, db: Session = Depends(get_db)) -> 
         leave_type=rule.key,
         annual_days=rule.annual_days,
         year=date.today().year,
+    )
+    next_version = (db.scalar(select(func.max(LeavePolicyVersion.version))) or 0) + 1
+    db.add(
+        LeavePolicyVersion(
+            version=next_version,
+            raw_text=leave_policy.to_raw_text(),
+            rules_json=_policy_rules_json(),
+        )
     )
     db.commit()
     return {
@@ -224,17 +205,42 @@ def upsert_leave_type(payload: LeavePolicyIn, db: Session = Depends(get_db)) -> 
 
 
 @router.get("/admin/leave-policy-text")
-def get_leave_policy_text() -> dict[str, str]:
-    return {"text": leave_policy.to_raw_text()}
+def get_leave_policy_text(db: Session = Depends(get_db)) -> dict:
+    version = _sync_policy_from_db(db)
+    return {"text": leave_policy.to_raw_text(), "version": version.version}
+
+
+@router.get("/admin/leave-policy-versions")
+def get_leave_policy_versions(db: Session = Depends(get_db)) -> list[dict]:
+    _sync_policy_from_db(db)
+    versions = db.scalars(select(LeavePolicyVersion).order_by(LeavePolicyVersion.version.desc())).all()
+    return [
+        {
+            "version": item.version,
+            "raw_text": item.raw_text,
+            "created_by": item.created_by,
+            "created_at": item.created_at.isoformat(),
+        }
+        for item in versions
+    ]
 
 
 @router.put("/admin/leave-policy-text")
 def update_leave_policy_text(payload: PolicyTextIn, db: Session = Depends(get_db)) -> dict:
+    _sync_policy_from_db(db)
     try:
-        rules = leave_policy.replace_raw_text(payload.text)
+        rules = leave_policy.load_raw_text(payload.text)
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    next_version = (db.scalar(select(func.max(LeavePolicyVersion.version))) or 0) + 1
+    db.add(
+        LeavePolicyVersion(
+            version=next_version,
+            raw_text=payload.text.strip() + "\n",
+            rules_json=_policy_rules_json(),
+        )
+    )
     balance_service = BalanceService(db)
     for rule in rules.values():
         balance_service.initialize_default_balances_for_leave_type(
@@ -243,36 +249,11 @@ def update_leave_policy_text(payload: PolicyTextIn, db: Session = Depends(get_db
             year=date.today().year,
         )
     db.commit()
-    return {"status": "saved", "leave_types": list(rules.keys())}
+    return {"status": "saved", "version": next_version, "leave_types": list(rules.keys())}
 
 
-@router.post("/prototype/setup")
-def setup_prototype(db: Session = Depends(get_db)) -> dict[str, str]:
-    _setup_demo_data(db)
-    db.commit()
-    return {"status": "ready"}
-
-
-@router.post("/prototype/reset")
-def reset_prototype(db: Session = Depends(get_db)) -> dict[str, str]:
-    create_all()
-    for model in (
-        ApprovalEvent,
-        LeaveBalanceLedger,
-        LeaveRequest,
-        ConversationSession,
-        SlackSyncRun,
-        ManagerMapping,
-        Employee,
-    ):
-        db.execute(delete(model))
-    _setup_demo_data(db)
-    db.commit()
-    return {"status": "reset"}
-
-
-@router.get("/prototype/state")
-def prototype_state(db: Session = Depends(get_db)) -> dict:
+@router.get("/admin/state")
+def admin_state(db: Session = Depends(get_db)) -> dict:
     create_all()
     employees = db.scalars(select(Employee).order_by(Employee.id)).all()
     requests = db.scalars(select(LeaveRequest).order_by(LeaveRequest.id.desc())).all()
@@ -326,17 +307,6 @@ def prototype_state(db: Session = Depends(get_db)) -> dict:
     }
 
 
-@router.post("/messages/mock", response_model=ParsedMessage)
-def parse_mock_message(payload: MockMessageIn) -> ParsedMessage:
-    return MockMessageParser().parse(payload.text)
-
-
-@router.post("/prototype/chat")
-def prototype_chat(payload: ChatIn, db: Session = Depends(get_db)) -> dict:
-    create_all()
-    return _process_chat(payload, db)
-
-
 @router.post("/slack/events")
 async def slack_events(
     request: Request,
@@ -375,8 +345,43 @@ async def slack_events(
     return {"ok": True}
 
 
+@router.post("/slack/interactions")
+async def slack_interactions(
+    request: Request,
+    x_slack_signature: str | None = Header(default=None),
+    x_slack_request_timestamp: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict:
+    raw_body = await request.body()
+    _verify_slack_signature(raw_body, x_slack_signature, x_slack_request_timestamp)
+    form = parse_qs(raw_body.decode("utf-8"))
+    payload = json.loads(form.get("payload", ["{}"])[0])
+    user_id = payload.get("user", {}).get("id")
+    action = (payload.get("actions") or [{}])[0]
+    request_id = action.get("value")
+    action_id = action.get("action_id")
+    if not user_id or not request_id or action_id not in {"approve_leave", "reject_leave"}:
+        return {"response_type": "ephemeral", "text": "Invalid approval action."}
+
+    approver = db.scalar(select(Employee).where(Employee.slack_user_id == user_id))
+    if approver is None:
+        return {"response_type": "ephemeral", "text": "Your Slack account is not registered as an approver."}
+    result = _handle_chat_approval(
+        f"{'approve' if action_id == 'approve_leave' else 'reject'} request {request_id}",
+        approver,
+        db,
+    )
+    if result is None:
+        return {"response_type": "ephemeral", "text": "The approval could not be processed."}
+    if result.get("type") in {"request_approved", "request_rejected"}:
+        _send_slack_side_effects(result, RealSlackClient(), db)
+        return {"replace_original": True, "text": result["reply"]}
+    return {"response_type": "ephemeral", "text": result["reply"]}
+
+
 def _process_chat(payload: ChatIn, db: Session) -> dict:
     create_all()
+    _sync_policy_from_db(db)
     employee = db.scalar(select(Employee).where(Employee.slack_user_id == payload.slack_user_id))
     if employee is None:
         return {
@@ -439,9 +444,14 @@ def _send_slack_side_effects(result: dict, slack: RealSlackClient, db: Session) 
         request_id = result["request"]["id"]
         request = db.get(LeaveRequest, request_id)
         if request and request.employee.manager:
-            slack.send_message(
+            slack.send_leave_approval(
                 request.employee.manager.slack_user_id,
-                f"{request.employee.name} submitted {request.leave_type} leave request #{request.id} for {float(request.days_requested):g} day(s). Reply `approve request {request.id}` or `reject request {request.id}`.",
+                request.id,
+                request.employee.name,
+                request.leave_type,
+                str(request.start_date),
+                str(request.end_date),
+                float(request.days_requested),
             )
     elif result.get("type") in {"request_approved", "request_rejected"}:
         request_id = result["request"]["id"]
@@ -449,35 +459,6 @@ def _send_slack_side_effects(result: dict, slack: RealSlackClient, db: Session) 
         if request:
             status = "approved" if result["type"] == "request_approved" else "rejected"
             slack.send_message(request.employee.slack_user_id, f"Your leave request #{request.id} has been {status}.")
-
-
-@router.post("/messages/mock/submit", response_model=LeaveRequestRead)
-def submit_mock_message(payload: MockMessageIn, db: Session = Depends(get_db)) -> LeaveRequest:
-    create_all()
-    employee = db.scalar(select(Employee).where(Employee.slack_user_id == payload.slack_user_id))
-    if employee is None:
-        raise HTTPException(status_code=404, detail="Unknown Slack user")
-
-    parsed = MockMessageParser().parse(payload.text)
-    if parsed.intent != "create_leave_request" or parsed.missing_fields:
-        raise HTTPException(status_code=422, detail={"missing_fields": parsed.missing_fields})
-
-    request = LeaveRequestService(db).create_request(
-        LeaveRequestCreate(
-            employee_id=employee.id,
-            leave_type=parsed.leave_type or "",
-            start_date=parsed.start_date,
-            end_date=parsed.end_date,
-            reason=parsed.reason,
-            document_key=payload.document_key,
-        )
-    )
-    rule = leave_policy.get(request.leave_type)
-    handle = LocalApprovalWorkflow().start(request.id, rule.requires_hr)
-    request.agentspan_execution_id = handle.execution_id
-    db.commit()
-    db.refresh(request)
-    return request
 
 
 def _is_balance_query(text: str) -> bool:
@@ -636,6 +617,18 @@ def _close_session(session: ConversationSession | None) -> None:
 
 def _parse_leave_message_from_policy(text: str, existing_fields: dict | None = None) -> ParsedMessage:
     existing_fields = existing_fields or {}
+    if settings.groq_api_key:
+        try:
+            parsed = GroqMessageParser().parse(
+                text,
+                leave_types=list(leave_policy.all()),
+                existing_fields=existing_fields,
+            )
+            if parsed.leave_type in leave_policy.all() or parsed.leave_type is None:
+                return parsed
+        except (httpx.HTTPError, KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError):
+            pass
+
     normalized = text.lower()
     leave_type = existing_fields.get("leave_type")
     for key, rule in leave_policy.all().items():
@@ -672,6 +665,38 @@ def _parse_leave_message_from_policy(text: str, existing_fields: dict | None = N
         reason=existing_fields.get("reason") or text,
         confidence=0.7 if not missing else 0.35,
         missing_fields=missing,
+    )
+
+
+def _sync_policy_from_db(db: Session) -> LeavePolicyVersion:
+    version = db.scalar(select(LeavePolicyVersion).order_by(LeavePolicyVersion.version.desc()))
+    if version is None:
+        version = LeavePolicyVersion(
+            version=1,
+            raw_text=leave_policy.to_raw_text(),
+            rules_json=_policy_rules_json(),
+            created_by="system_seed",
+        )
+        db.add(version)
+        db.commit()
+        db.refresh(version)
+    else:
+        leave_policy.load_raw_text(version.raw_text)
+    return version
+
+
+def _policy_rules_json() -> str:
+    return json.dumps(
+        {
+            key: {
+                "display_name": rule.display_name,
+                "annual_days": rule.annual_days,
+                "requires_document": rule.requires_document,
+                "requires_hr": rule.requires_hr,
+                "allow_negative_balance": rule.allow_negative_balance,
+            }
+            for key, rule in leave_policy.all().items()
+        }
     )
 
 

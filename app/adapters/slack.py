@@ -52,9 +52,75 @@ class RealSlackClient(SlackClient):
         self._post_message(channel=channel_id, text=text)
 
     def send_approval_card(self, slack_user_id: str, leave_request_id: int, stage: str) -> None:
-        self.send_message(
-            slack_user_id,
-            f"Leave request #{leave_request_id} is waiting for {stage} approval. Reply `approve request {leave_request_id}` or `reject request {leave_request_id}`.",
+        self._post_message(
+            channel=slack_user_id,
+            text=f"Leave request #{leave_request_id} is waiting for {stage} approval.",
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"*Leave request #{leave_request_id}* is waiting for {stage} approval."},
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Approve"},
+                            "style": "primary",
+                            "action_id": "approve_leave",
+                            "value": str(leave_request_id),
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Reject"},
+                            "style": "danger",
+                            "action_id": "reject_leave",
+                            "value": str(leave_request_id),
+                        },
+                    ],
+                },
+            ],
+        )
+
+    def send_leave_approval(
+        self,
+        slack_user_id: str,
+        request_id: int,
+        employee_name: str,
+        leave_type: str,
+        start_date: str,
+        end_date: str,
+        days: float,
+    ) -> None:
+        summary = (
+            f"*{employee_name}* requested *{leave_type} leave*\n"
+            f"{start_date} to {end_date} | {days:g} day(s) | Request #{request_id}"
+        )
+        self._post_message(
+            channel=slack_user_id,
+            text=f"{employee_name} submitted leave request #{request_id}.",
+            blocks=[
+                {"type": "section", "text": {"type": "mrkdwn", "text": summary}},
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Approve"},
+                            "style": "primary",
+                            "action_id": "approve_leave",
+                            "value": str(request_id),
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Reject"},
+                            "style": "danger",
+                            "action_id": "reject_leave",
+                            "value": str(request_id),
+                        },
+                    ],
+                },
+            ],
         )
 
     def list_users(self) -> list[SlackUser]:
@@ -91,8 +157,11 @@ class RealSlackClient(SlackClient):
             )
         return directory
 
-    def _post_message(self, channel: str, text: str) -> None:
-        self._api("chat.postMessage", {"channel": channel, "text": text})
+    def _post_message(self, channel: str, text: str, blocks: list[dict] | None = None) -> None:
+        payload = {"channel": channel, "text": text}
+        if blocks:
+            payload["blocks"] = blocks
+        self._api("chat.postMessage", payload)
 
     def _api(self, method: str, payload: dict) -> dict:
         if not self.token:

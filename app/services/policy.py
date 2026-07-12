@@ -58,6 +58,7 @@ class LeavePolicy:
         requires_document: bool,
         requires_hr: bool,
         allow_negative_balance: bool,
+        persist: bool = True,
     ) -> LeaveTypePolicy:
         normalized_key = self._normalize_key(key)
         if annual_days < 0:
@@ -71,21 +72,33 @@ class LeavePolicy:
             "requires_hr": requires_hr,
             "allow_negative_balance": allow_negative_balance,
         }
-        self.path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+        if persist:
+            self.path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
         self._rules = self._parse(raw)
         return self._rules[normalized_key]
 
-    def replace_raw_text(self, text: str) -> dict[str, LeaveTypePolicy]:
+    def replace_raw_text(self, text: str, persist: bool = True) -> dict[str, LeaveTypePolicy]:
         raw = self._parse_plain_text(text)
         parsed = self._parse(raw)
-        self.path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+        if persist:
+            self.path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
         self._rules = parsed
         return self._rules
 
+    def load_raw_text(self, text: str) -> dict[str, LeaveTypePolicy]:
+        return self.replace_raw_text(text, persist=False)
+
     def to_raw(self) -> dict[str, dict]:
-        if not self.path.exists():
-            return {}
-        return json.loads(self.path.read_text(encoding="utf-8"))
+        return {
+            key: {
+                "display_name": rule.display_name,
+                "annual_days": rule.annual_days,
+                "requires_document": rule.requires_document,
+                "requires_hr": rule.requires_hr,
+                "allow_negative_balance": rule.allow_negative_balance,
+            }
+            for key, rule in self._rules.items()
+        }
 
     def to_raw_text(self) -> str:
         lines = []

@@ -11,7 +11,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.api import routes
 from app.main import app
-from app.db.models import Employee, LeaveRequestStatus
+from app.adapters.slack import RealSlackClient
+from app.db.models import Employee, LeavePolicyVersion, LeaveRequestStatus
 from app.db.session import Base
 from app.schemas.leave import LeaveRequestCreate
 from app.services.balances import BalanceService
@@ -196,3 +197,43 @@ def test_slack_url_verification_checks_signature() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"challenge": "abc123"}
+
+
+def test_database_policy_version_restores_active_policy(tmp_path, db: Session, monkeypatch) -> None:
+    policy_path = tmp_path / "leave_policy.json"
+    policy_path.write_text("{}", encoding="utf-8")
+    policy = LeavePolicy(policy_path)
+    monkeypatch.setattr(routes, "leave_policy", policy)
+    db.add(
+        LeavePolicyVersion(
+            version=2,
+            raw_text="Study Leave: 5 days maximum. Document required. HR approval required.\n",
+            rules_json="{}",
+        )
+    )
+    db.commit()
+
+    version = routes._sync_policy_from_db(db)
+
+    assert version.version == 2
+    assert policy.get("study_leave").requires_document
+    assert policy.get("study_leave").requires_hr
+
+
+def test_slack_approval_message_contains_buttons(monkeypatch) -> None:
+    sent = {}
+    client = RealSlackClient(token="test-token")
+
+    def capture(method: str, payload: dict) -> dict:
+        sent.update({"method": method, "payload": payload})
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_api", capture)
+    client.send_leave_approval("U_MANAGER", 42, "Temi", "annual", "2026-07-15", "2026-07-16", 2)
+
+    actions = sent["payload"]["blocks"][1]["elements"]
+    assert sent["method"] == "chat.postMessage"
+    assert [(action["action_id"], action["value"]) for action in actions] == [
+        ("approve_leave", "42"),
+        ("reject_leave", "42"),
+    ]

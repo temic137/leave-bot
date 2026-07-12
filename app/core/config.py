@@ -14,7 +14,8 @@ class Settings(BaseSettings):
     slack_bot_token: str = ""
     slack_signing_secret: str = ""
 
-    openai_api_key: str = ""
+    groq_api_key: str = ""
+    groq_model: str = "qwen/qwen3.6-27b"
     agentspan_api_key: str = ""
 
     aws_access_key_id: str = ""

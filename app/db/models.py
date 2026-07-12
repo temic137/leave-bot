@@ -125,3 +125,14 @@ class ManagerMapping(Base):
     manager_email: Mapped[str | None] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(32), default=EmployeeRole.employee.value)
     department: Mapped[str | None] = mapped_column(String(128))
+
+
+class LeavePolicyVersion(Base):
+    __tablename__ = "leave_policy_versions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version: Mapped[int] = mapped_column(unique=True, index=True)
+    raw_text: Mapped[str] = mapped_column(Text)
+    rules_json: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(255), default="admin")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
