@@ -69,19 +69,6 @@ class LeaveRequest(Base):
     employee: Mapped[Employee] = relationship()
 
 
-class LeaveBalanceLedger(Base):
-    __tablename__ = "leave_balance_ledger"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), index=True)
-    leave_type: Mapped[str] = mapped_column(String(64), index=True)
-    year: Mapped[int] = mapped_column(index=True)
-    change_days: Mapped[float] = mapped_column(Numeric(6, 2))
-    reason: Mapped[str] = mapped_column(String(255))
-    leave_request_id: Mapped[int | None] = mapped_column(ForeignKey("leave_requests.id"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
-
-
 class ApprovalEvent(Base):
     __tablename__ = "approval_events"
 

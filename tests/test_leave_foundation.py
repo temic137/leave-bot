@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.api import routes
 from app.main import app
 from app.adapters.slack import RealSlackClient
+from app.adapters.workflow import AgentSpanApprovalWorkflow
 from app.db.models import Employee, LeavePolicyVersion, LeaveRequestStatus
 from app.db.session import Base
 from app.schemas.leave import LeaveRequestCreate
@@ -47,11 +48,10 @@ def seed_people(db: Session) -> tuple[Employee, Employee, Employee]:
     return employee, manager, hr
 
 
-def test_database_schema_has_only_the_six_core_tables() -> None:
+def test_database_schema_has_only_the_five_core_tables() -> None:
     assert set(Base.metadata.tables) == {
         "employees",
         "leave_requests",
-        "leave_balance_ledger",
         "approval_events",
         "leave_policy_versions",
         "conversation_sessions",
@@ -86,7 +86,7 @@ def test_manager_approval_deducts_balance_for_manager_only_leave(db: Session) ->
     db.flush()
 
     assert request.status == LeaveRequestStatus.approved.value
-    assert balances.get_balance(employee.id, "annual", 2026) == 17.0
+    assert balances.get_taken_days(employee.id, "annual", 2026) == 3.0
 
 
 def test_hr_required_leave_waits_after_manager_approval(db: Session) -> None:
@@ -107,14 +107,14 @@ def test_hr_required_leave_waits_after_manager_approval(db: Session) -> None:
     LeaveRequestService(db).record_manager_decision(manager, request, approved=True)
     db.flush()
     assert request.status == LeaveRequestStatus.pending_hr.value
-    assert balances.get_balance(employee.id, "maternity", 2026) == 90.0
+    assert balances.get_taken_days(employee.id, "maternity", 2026) == 0.0
 
     assert can_approve_request(hr, request)
     LeaveRequestService(db).record_hr_decision(hr, request, approved=True)
     db.flush()
 
     assert request.status == LeaveRequestStatus.approved.value
-    assert balances.get_balance(employee.id, "maternity", 2026) == 87.0
+    assert balances.get_taken_days(employee.id, "maternity", 2026) == 3.0
 
 
 def test_document_required_leave_rejects_missing_document(db: Session) -> None:
@@ -164,7 +164,61 @@ def test_admin_can_add_leave_type_policy(tmp_path, db: Session) -> None:
 
     assert rule.key == "study_leave"
     assert policy.get("study_leave").requires_hr
-    assert BalanceService(db, policy).get_balance(employee.id, "study_leave", 2026) == 5.0
+    assert BalanceService(db, policy).get_taken_days(employee.id, "study_leave", 2026) == 0.0
+
+
+def test_agentspan_workflow_starts_idempotent_execution(monkeypatch) -> None:
+    calls = []
+
+    class Response:
+        text = "workflow-123"
+
+        def raise_for_status(self):
+            return None
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return Response()
+
+    monkeypatch.setattr("app.adapters.workflow.httpx.request", request)
+    handle = AgentSpanApprovalWorkflow("http://agentspan:6767").start(42, requires_hr=True)
+
+    assert handle.execution_id == "workflow-123"
+    assert calls[0][1].endswith("/api/workflow/leave_approval_manager_hr_v1")
+    assert calls[0][2]["params"]["correlationId"] == "leave-request-42"
+    assert calls[0][2]["json"] == {"leave_request_id": 42}
+
+
+@pytest.mark.parametrize("approved", [True, False])
+def test_agentspan_workflow_forwards_human_decision(monkeypatch, approved: bool) -> None:
+    calls = []
+
+    class Response:
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "tasks": [
+                    {"taskType": "HUMAN", "status": "IN_PROGRESS", "taskId": "task-1"}
+                ]
+            }
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return Response()
+
+    monkeypatch.setattr("app.adapters.workflow.httpx.request", request)
+    AgentSpanApprovalWorkflow("http://agentspan:6767").decide("workflow-123", approved, "not allowed")
+
+    if approved:
+        assert [call[0] for call in calls] == ["GET", "POST"]
+        assert calls[1][2]["json"]["taskId"] == "task-1"
+    else:
+        assert [call[0] for call in calls] == ["DELETE"]
+        assert calls[0][2]["params"]["reason"] == "not allowed"
 
 
 def test_admin_can_edit_policy_as_plain_text(tmp_path) -> None:

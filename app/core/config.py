@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     groq_api_key: str = ""
     groq_model: str = "qwen/qwen3.6-27b"
-    agentspan_api_key: str = ""
+    agentspan_server_url: str = ""
 
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""

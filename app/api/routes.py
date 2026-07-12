@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.adapters.llm import GroqMessageParser
 from app.adapters.slack import RealSlackClient
-from app.adapters.workflow import LocalApprovalWorkflow
+from app.adapters.workflow import AgentSpanApprovalWorkflow
 from app.core.config import settings
 from app.db.models import ConversationSession, Employee, LeavePolicyVersion, LeaveRequest
 from app.db.session import create_all, get_db
@@ -87,19 +87,6 @@ def list_real_slack_users() -> list[dict]:
     return RealSlackClient().list_user_directory()
 
 
-@router.post("/admin/balances/initialize")
-def initialize_balances(year: int | None = None, db: Session = Depends(get_db)) -> dict[str, int]:
-    create_all()
-    target_year = year or date.today().year
-    service = BalanceService(db)
-    count = 0
-    for employee in db.scalars(select(Employee)).all():
-        service.initialize_default_balances(employee.id, target_year)
-        count += 1
-    db.commit()
-    return {"employees_initialized": count}
-
-
 @router.post("/admin/employees")
 def create_employee(payload: EmployeeIn, db: Session = Depends(get_db)) -> dict:
     create_all()
@@ -124,7 +111,6 @@ def create_employee(payload: EmployeeIn, db: Session = Depends(get_db)) -> dict:
         employee.department = payload.department
         employee.manager_id = payload.manager_id
     db.flush()
-    BalanceService(db).initialize_default_balances(employee.id, date.today().year)
     db.commit()
     db.refresh(employee)
     return {
@@ -170,11 +156,6 @@ def upsert_leave_type(payload: LeavePolicyIn, db: Session = Depends(get_db)) -> 
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    BalanceService(db).initialize_default_balances_for_leave_type(
-        leave_type=rule.key,
-        annual_days=rule.annual_days,
-        year=date.today().year,
-    )
     next_version = (db.scalar(select(func.max(LeavePolicyVersion.version))) or 0) + 1
     db.add(
         LeavePolicyVersion(
@@ -231,13 +212,6 @@ def update_leave_policy_text(payload: PolicyTextIn, db: Session = Depends(get_db
             rules_json=_policy_rules_json(),
         )
     )
-    balance_service = BalanceService(db)
-    for rule in rules.values():
-        balance_service.initialize_default_balances_for_leave_type(
-            leave_type=rule.key,
-            annual_days=rule.annual_days,
-            year=date.today().year,
-        )
     db.commit()
     return {"status": "saved", "version": next_version, "leave_types": list(rules.keys())}
 
@@ -521,7 +495,14 @@ def _handle_leave_request_chat(payload: ChatIn, employee: Employee, db: Session)
     except ValueError as exc:
         return {"type": "validation_error", "reply": str(exc), "parsed": parsed.model_dump(mode="json")}
 
-    handle = LocalApprovalWorkflow().start(request.id, rule.requires_hr)
+    try:
+        handle = AgentSpanApprovalWorkflow().start(request.id, rule.requires_hr)
+    except Exception:
+        db.rollback()
+        return {
+            "type": "workflow_unavailable",
+            "reply": "I could not start the approval workflow. Please try again shortly; no leave request was submitted.",
+        }
     request.agentspan_execution_id = handle.execution_id
     _close_session(session)
     db.commit()
@@ -550,6 +531,19 @@ def _handle_chat_approval(text: str, approver: Employee, db: Session) -> dict | 
         return {"type": "not_found", "reply": "I could not find that leave request."}
     if not can_approve_request(approver, request):
         return {"type": "permission_denied", "reply": f"{approver.name} is not allowed to approve or reject request #{request.id}."}
+
+    if request.agentspan_execution_id:
+        try:
+            AgentSpanApprovalWorkflow().decide(
+                request.agentspan_execution_id,
+                approved,
+                "Rejected from Slack" if not approved else "",
+            )
+        except Exception:
+            return {
+                "type": "workflow_unavailable",
+                "reply": "AgentSpan could not record that decision. Nothing was changed; please try again.",
+            }
 
     service = LeaveRequestService(db)
     if request.status == "pending_manager":

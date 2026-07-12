@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from fastapi.responses import FileResponse
 
 from app.api.routes import router
+from app.adapters.workflow import AgentSpanApprovalWorkflow
 from app.core.config import settings
 from app.db.session import create_all
 
@@ -14,6 +15,7 @@ app.include_router(router)
 @app.on_event("startup")
 def initialize_database() -> None:
     create_all()
+    AgentSpanApprovalWorkflow.start_worker()
 
 
 @app.middleware("http")
