@@ -33,6 +33,21 @@ Open:
 http://127.0.0.1:8000/docs
 ```
 
+## Railway Environment
+
+Configure these variables in Railway. Never commit their values:
+
+```text
+APP_ENV=production
+ADMIN_API_KEY=<random-secret>
+DATABASE_URL=<Supabase transaction pooler URL>
+SLACK_BOT_TOKEN=<Slack bot token>
+SLACK_SIGNING_SECRET=<Slack signing secret>
+```
+
+Production requests to `/admin/*` and `/prototype/*` must include the
+`X-Admin-API-Key` header. Slack events remain available at `/slack/events`.
+
 ## First MVP Flow
 
 1. Seed or sync employees from Slack.
@@ -60,4 +75,3 @@ users:read.email
 ```
 
 These are captured in `docs/slack-permissions.md`.
-

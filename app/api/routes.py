@@ -143,7 +143,9 @@ def initialize_balances(year: int | None = None, db: Session = Depends(get_db)) 
 @router.post("/admin/employees")
 def create_employee(payload: EmployeeIn, db: Session = Depends(get_db)) -> dict:
     create_all()
-    existing = db.scalar(select(Employee).where(Employee.email == payload.email))
+    existing = db.scalar(select(Employee).where(Employee.slack_user_id == payload.slack_user_id))
+    if existing is None:
+        existing = db.scalar(select(Employee).where(Employee.email == payload.email))
     if existing is None:
         employee = Employee(
             slack_user_id=payload.slack_user_id,
@@ -354,7 +356,7 @@ async def slack_events(
         return {"ok": True}
 
     event = payload.get("event", {})
-    if x_slack_retry_num or event.get("bot_id") or event.get("subtype"):
+    if event.get("bot_id") or event.get("subtype"):
         return {"ok": True}
 
     if event.get("type") not in {"message", "app_mention"}:

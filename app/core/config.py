@@ -5,6 +5,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     app_name: str = "Slack Leave Bot"
+    app_env: str = "development"
+    admin_api_key: str = ""
     database_url: str = "sqlite:///./leavebot.db"
     leave_policy_path: str = "config/leave_policy.json"
     manager_mapping_csv: str = "config/manager_mapping.sample.csv"
@@ -29,4 +31,3 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
-
