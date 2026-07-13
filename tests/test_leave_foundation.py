@@ -48,13 +48,14 @@ def seed_people(db: Session) -> tuple[Employee, Employee, Employee]:
     return employee, manager, hr
 
 
-def test_database_schema_has_only_the_five_core_tables() -> None:
+def test_database_schema_has_five_business_tables_and_one_job_table() -> None:
     assert set(Base.metadata.tables) == {
         "employees",
         "leave_requests",
         "approval_events",
         "leave_policy_versions",
         "conversation_sessions",
+        "durable_jobs",
     }
 
 

@@ -16,6 +16,8 @@ Use this while waiting for the Slack app approval so the API is ready to receive
 
 Railway can deploy directly from a GitHub repository.
 
+The API container runs `alembic upgrade head` before starting Uvicorn. This applies schema changes to both a new database and the existing prototype database.
+
 Make sure these files are committed:
 
 ```text
@@ -99,7 +101,7 @@ You will get a URL like:
 https://your-service.up.railway.app
 ```
 
-Check:
+Check liveness:
 
 ```text
 https://your-service.up.railway.app/health
@@ -109,6 +111,18 @@ Expected:
 
 ```json
 {"status":"ok"}
+```
+
+Check readiness:
+
+```text
+https://your-service.up.railway.app/health/ready
+```
+
+Check the durable queue and dependency configuration:
+
+```text
+https://your-service.up.railway.app/health/dependencies
 ```
 
 ## 6. Configure Slack Event URL
@@ -197,23 +211,28 @@ Expected:
 annual: 2 days taken
 ```
 
-## Current Deployment Limitations
+## Current Deployment Status
 
-This is still a proof-of-workflow deployment.
+Implemented:
 
-Not production complete yet:
+- Alembic database migrations.
+- Production admin API-key protection.
+- Slack approval buttons and natural-text approvals.
+- Durable PostgreSQL job queue with retries and idempotency.
+- Durable AgentSpan manager and HR workflow stages.
+- Structured logs and liveness, readiness, and dependency endpoints.
 
-- No database migrations; app creates tables via SQLAlchemy during requests.
-- No admin authentication on prototype UI.
-- No Slack buttons yet; approvals use text commands.
-- No Slack file upload/S3 document handling yet.
-- No Agentspan durable workflow yet.
+Still incomplete:
 
-For demo/testing, this is enough to prove:
+- Slack file upload/document storage, intentionally deferred.
+- Production alert delivery for dead jobs.
+- A protected admin action for manually replaying dead jobs.
+- Live failure testing against the deployed Slack, Groq, AgentSpan, and Supabase services.
+
+For pilot testing, this is enough to prove:
 
 - Railway API is reachable by Slack.
 - Slack signature verification works.
 - Employee can request leave in Slack.
 - Manager can approve/reject in Slack.
 - Leave taken updates after approval.
-

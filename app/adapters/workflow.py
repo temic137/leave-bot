@@ -31,6 +31,9 @@ class AgentSpanApprovalWorkflow:
         self._ensure_registered(False)
         self._ensure_registered(True)
 
+    def ensure_registered(self, requires_hr: bool) -> None:
+        self._ensure_registered(requires_hr)
+
     def _ensure_registered(self, requires_hr: bool) -> None:
         name = self.hr_workflow if requires_hr else self.manager_workflow
         response = httpx.get(
@@ -55,13 +58,16 @@ class AgentSpanApprovalWorkflow:
         )
         return WorkflowHandle(execution_id=response.text.strip('"'))
 
-    def decide(self, execution_id: str, approved: bool, reason: str = "") -> None:
+    def decide(self, execution_id: str, approved: bool, reason: str = "", stage: str | None = None) -> None:
         if not approved:
-            self._request(
+            response = httpx.request(
                 "DELETE",
-                f"/api/workflow/{execution_id}",
+                self.server_url + f"/api/workflow/{execution_id}",
                 params={"reason": reason or "Leave request rejected"},
+                timeout=self.timeout,
             )
+            if getattr(response, "status_code", 200) != 404:
+                response.raise_for_status()
             return
 
         execution = self._request(
@@ -69,13 +75,22 @@ class AgentSpanApprovalWorkflow:
             f"/api/workflow/{execution_id}",
             params={"includeTasks": "true"},
         ).json()
-        active_tasks = [
+        task_reference = f"{stage}_approval" if stage else None
+        matching_tasks = [
             task
             for task in execution.get("tasks", [])
-            if task.get("taskType") == "HUMAN" and task.get("status") == "IN_PROGRESS"
+            if task.get("taskType") == "HUMAN"
+            and (
+                task_reference is None
+                or (task.get("taskReferenceName") or task.get("referenceTaskName")) == task_reference
+            )
         ]
+        completed = [task for task in matching_tasks if task.get("status") == "COMPLETED"]
+        if task_reference and completed:
+            return
+        active_tasks = [task for task in matching_tasks if task.get("status") == "IN_PROGRESS"]
         if len(active_tasks) != 1:
-            raise RuntimeError(f"Expected one active AgentSpan approval task, found {len(active_tasks)}")
+            raise RuntimeError(f"Expected one active AgentSpan {stage or ''} approval task, found {len(active_tasks)}")
         task = active_tasks[0]
         self._request(
             "POST",

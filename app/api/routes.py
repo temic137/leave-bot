@@ -2,6 +2,7 @@ from datetime import date
 import hashlib
 import hmac
 import json
+import logging
 import re
 import time
 from urllib.parse import parse_qs
@@ -14,19 +15,20 @@ from sqlalchemy.orm import Session
 
 from app.adapters.llm import GroqMessageParser
 from app.adapters.slack import RealSlackClient
-from app.adapters.workflow import AgentSpanApprovalWorkflow
 from app.core.config import settings
 from app.db.models import ConversationSession, Employee, LeavePolicyVersion, LeaveRequest
-from app.db.session import create_all, get_db
+from app.db.session import get_db
 from app.schemas.leave import BalanceRead, LeaveRequestCreate, LeaveRequestRead, ParsedMessage
 from app.services.balances import BalanceService
 from app.services.employee_sync import EmployeeSyncService
 from app.services.leave_requests import LeaveRequestService
+from app.services.jobs import enqueue_job
 from app.services.permissions import can_approve_request, can_view_balance
 from app.services.policy import leave_policy
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class DecisionIn(BaseModel):
@@ -65,13 +67,11 @@ class EmployeeIn(BaseModel):
 
 @router.post("/admin/init-db")
 def init_db() -> dict[str, str]:
-    create_all()
-    return {"status": "created"}
+    return {"status": "managed by Alembic migrations"}
 
 
 @router.post("/admin/sync/slack")
 def sync_real_slack(db: Session = Depends(get_db)) -> dict[str, int]:
-    create_all()
     slack = RealSlackClient()
     service = EmployeeSyncService(db)
     count = 0
@@ -89,7 +89,6 @@ def list_real_slack_users() -> list[dict]:
 
 @router.post("/admin/employees")
 def create_employee(payload: EmployeeIn, db: Session = Depends(get_db)) -> dict:
-    create_all()
     existing = db.scalar(select(Employee).where(Employee.slack_user_id == payload.slack_user_id))
     if existing is None:
         existing = db.scalar(select(Employee).where(Employee.email == payload.email))
@@ -218,7 +217,6 @@ def update_leave_policy_text(payload: PolicyTextIn, db: Session = Depends(get_db
 
 @router.get("/admin/state")
 def admin_state(db: Session = Depends(get_db)) -> dict:
-    create_all()
     employees = db.scalars(select(Employee).order_by(Employee.id)).all()
     requests = db.scalars(select(LeaveRequest).order_by(LeaveRequest.id.desc())).all()
     target_year = date.today().year
@@ -286,26 +284,22 @@ async def slack_events(
     if payload.get("type") == "url_verification":
         return {"challenge": payload["challenge"]}
 
-    if payload.get("type") != "event_callback":
-        return {"ok": True}
-
-    event = payload.get("event", {})
-    if event.get("bot_id") or event.get("subtype"):
-        return {"ok": True}
-
-    if event.get("type") not in {"message", "app_mention"}:
-        return {"ok": True}
-
-    user_id = event.get("user")
-    channel_id = event.get("channel")
-    text = _strip_bot_mention(event.get("text", ""))
-    if not user_id or not channel_id or not text:
-        return {"ok": True}
-
-    result = _process_chat(ChatIn(slack_user_id=user_id, text=text), db)
-    slack = RealSlackClient()
-    slack.send_channel_message(channel_id, result["reply"])
-    _send_slack_side_effects(result, slack, db)
+    if payload.get("type") == "event_callback":
+        event_id = payload.get("event_id") or hashlib.sha256(raw_body).hexdigest()
+        enqueue_job(
+            db,
+            "process_slack_event",
+            f"slack-event:{event_id}",
+            {"slack_payload": payload, "retry_num": x_slack_retry_num},
+        )
+        db.commit()
+        logger.info(
+            "Slack event accepted",
+            extra={
+                "slack_event_id": event_id,
+                "slack_user_id": payload.get("event", {}).get("user"),
+            },
+        )
     return {"ok": True}
 
 
@@ -320,31 +314,19 @@ async def slack_interactions(
     _verify_slack_signature(raw_body, x_slack_signature, x_slack_request_timestamp)
     form = parse_qs(raw_body.decode("utf-8"))
     payload = json.loads(form.get("payload", ["{}"])[0])
-    user_id = payload.get("user", {}).get("id")
     action = (payload.get("actions") or [{}])[0]
-    request_id = action.get("value")
-    action_id = action.get("action_id")
-    if not user_id or not request_id or action_id not in {"approve_leave", "reject_leave"}:
-        return {"response_type": "ephemeral", "text": "Invalid approval action."}
-
-    approver = db.scalar(select(Employee).where(Employee.slack_user_id == user_id))
-    if approver is None:
-        return {"response_type": "ephemeral", "text": "Your Slack account is not registered as an approver."}
-    result = _handle_chat_approval(
-        f"{'approve' if action_id == 'approve_leave' else 'reject'} request {request_id}",
-        approver,
+    interaction_id = action.get("action_ts") or payload.get("trigger_id") or hashlib.sha256(raw_body).hexdigest()
+    enqueue_job(
         db,
+        "process_slack_interaction",
+        f"slack-interaction:{interaction_id}",
+        {"interaction": payload},
     )
-    if result is None:
-        return {"response_type": "ephemeral", "text": "The approval could not be processed."}
-    if result.get("type") in {"request_approved", "request_rejected"}:
-        _send_slack_side_effects(result, RealSlackClient(), db)
-        return {"replace_original": True, "text": result["reply"]}
-    return {"response_type": "ephemeral", "text": result["reply"]}
+    db.commit()
+    return {"response_type": "ephemeral", "text": "Processing your decision..."}
 
 
 def _process_chat(payload: ChatIn, db: Session) -> dict:
-    create_all()
     _sync_policy_from_db(db)
     employee = db.scalar(select(Employee).where(Employee.slack_user_id == payload.slack_user_id))
     if employee is None:
@@ -403,28 +385,6 @@ def _strip_bot_mention(text: str) -> str:
     return re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
 
 
-def _send_slack_side_effects(result: dict, slack: RealSlackClient, db: Session) -> None:
-    if result.get("type") == "leave_submitted":
-        request_id = result["request"]["id"]
-        request = db.get(LeaveRequest, request_id)
-        if request and request.employee.manager:
-            slack.send_leave_approval(
-                request.employee.manager.slack_user_id,
-                request.id,
-                request.employee.name,
-                request.leave_type,
-                str(request.start_date),
-                str(request.end_date),
-                float(request.days_requested),
-            )
-    elif result.get("type") in {"request_approved", "request_rejected"}:
-        request_id = result["request"]["id"]
-        request = db.get(LeaveRequest, request_id)
-        if request:
-            status = "approved" if result["type"] == "request_approved" else "rejected"
-            slack.send_message(request.employee.slack_user_id, f"Your leave request #{request.id} has been {status}.")
-
-
 def _is_balance_query(text: str) -> bool:
     return any(phrase in text for phrase in ("balance", "leave taken", "taken leave", "how many leave", "how many days"))
 
@@ -463,7 +423,7 @@ def _handle_leave_request_chat(payload: ChatIn, employee: Employee, db: Session)
 
     if parsed.missing_fields:
         _save_session(db, employee.slack_user_id, parsed)
-        db.commit()
+        db.flush()
         missing = ", ".join(parsed.missing_fields)
         return {
             "type": "missing_fields",
@@ -474,15 +434,21 @@ def _handle_leave_request_chat(payload: ChatIn, employee: Employee, db: Session)
     rule = leave_policy.get(parsed.leave_type or "")
     if rule.requires_document and not payload.document_key:
         _save_session(db, employee.slack_user_id, parsed)
-        db.commit()
+        db.flush()
         return {
             "type": "document_required",
             "reply": f"{rule.display_name} requires a document. Please attach a document before I send it for approval.",
             "parsed": parsed.model_dump(mode="json"),
         }
 
+    if employee.manager is None:
+        return {
+            "type": "validation_error",
+            "reply": "Your manager is not assigned yet. Ask an administrator to update your employee record before submitting leave.",
+        }
+
     try:
-        request = LeaveRequestService(db).create_request(
+        leave_request = LeaveRequestService(db).create_request(
             LeaveRequestCreate(
                 employee_id=employee.id,
                 leave_type=parsed.leave_type or "",
@@ -495,18 +461,8 @@ def _handle_leave_request_chat(payload: ChatIn, employee: Employee, db: Session)
     except ValueError as exc:
         return {"type": "validation_error", "reply": str(exc), "parsed": parsed.model_dump(mode="json")}
 
-    try:
-        handle = AgentSpanApprovalWorkflow().start(request.id, rule.requires_hr)
-    except Exception:
-        db.rollback()
-        return {
-            "type": "workflow_unavailable",
-            "reply": "I could not start the approval workflow. Please try again shortly; no leave request was submitted.",
-        }
-    request.agentspan_execution_id = handle.execution_id
     _close_session(session)
-    db.commit()
-    db.refresh(request)
+    db.flush()
 
     manager = employee.manager.name if employee.manager else "your manager"
     route = f"sent to {manager}"
@@ -515,8 +471,8 @@ def _handle_leave_request_chat(payload: ChatIn, employee: Employee, db: Session)
 
     return {
         "type": "leave_submitted",
-        "reply": f"Your {rule.display_name} request for {float(request.days_requested):g} day(s) has been {route}.",
-        "request": LeaveRequestRead.model_validate(request).model_dump(mode="json"),
+        "reply": f"Your {rule.display_name} request for {float(leave_request.days_requested):g} day(s) has been recorded. I am sending it to {manager} now.",
+        "request": LeaveRequestRead.model_validate(leave_request).model_dump(mode="json"),
     }
 
 
@@ -532,31 +488,12 @@ def _handle_chat_approval(text: str, approver: Employee, db: Session) -> dict | 
     if not can_approve_request(approver, request):
         return {"type": "permission_denied", "reply": f"{approver.name} is not allowed to approve or reject request #{request.id}."}
 
-    if request.agentspan_execution_id:
-        try:
-            AgentSpanApprovalWorkflow().decide(
-                request.agentspan_execution_id,
-                approved,
-                "Rejected from Slack" if not approved else "",
-            )
-        except Exception:
-            return {
-                "type": "workflow_unavailable",
-                "reply": "AgentSpan could not record that decision. Nothing was changed; please try again.",
-            }
-
-    service = LeaveRequestService(db)
-    if request.status == "pending_manager":
-        service.record_manager_decision(approver, request, approved, "chat decision")
-    else:
-        service.record_hr_decision(approver, request, approved, "chat decision")
-    db.commit()
-    db.refresh(request)
-
-    decision = "approved" if approved else "rejected"
     return {
-        "type": f"request_{decision}",
-        "reply": f"Request #{request.id} has been {decision}.",
+        "type": "approval_queued",
+        "reply": f"I am processing your decision for request #{request.id}.",
+        "approved": approved,
+        "approver_id": approver.id,
+        "stage": "manager" if request.status == "pending_manager" else "hr",
         "request": LeaveRequestRead.model_validate(request).model_dump(mode="json"),
     }
 
@@ -611,7 +548,7 @@ def _parse_leave_message_from_policy(text: str, existing_fields: dict | None = N
             if parsed.leave_type in leave_policy.all() or parsed.leave_type is None:
                 return parsed
         except (httpx.HTTPError, KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError):
-            pass
+            logger.warning("Groq parser unavailable; using deterministic fallback", exc_info=True)
 
     normalized = text.lower()
     leave_type = existing_fields.get("leave_type")
@@ -739,7 +676,6 @@ def get_employee_balance(
     year: int | None = None,
     db: Session = Depends(get_db),
 ) -> BalanceRead:
-    create_all()
     requester = db.scalar(select(Employee).where(Employee.slack_user_id == requester_slack_user_id))
     target = db.get(Employee, employee_id)
     if requester is None or target is None:
@@ -768,7 +704,6 @@ def hr_decision(request_id: int, payload: DecisionIn, db: Session = Depends(get_
 
 
 def _record_decision(request_id: int, payload: DecisionIn, stage: str, db: Session) -> LeaveRequest:
-    create_all()
     approver = db.scalar(select(Employee).where(Employee.slack_user_id == payload.approver_slack_user_id))
     request = db.get(LeaveRequest, request_id)
     if approver is None or request is None:
@@ -776,11 +711,18 @@ def _record_decision(request_id: int, payload: DecisionIn, stage: str, db: Sessi
     if not can_approve_request(approver, request):
         raise HTTPException(status_code=403, detail="Not allowed to approve this request")
 
-    service = LeaveRequestService(db)
-    if stage == "manager":
-        updated = service.record_manager_decision(approver, request, payload.approved, payload.comment)
-    else:
-        updated = service.record_hr_decision(approver, request, payload.approved, payload.comment)
+    enqueue_job(
+        db,
+        "decide_agentspan",
+        f"api-decision:{request.id}:{stage}:{approver.id}",
+        {
+            "leave_request_id": request.id,
+            "approver_id": approver.id,
+            "approved": payload.approved,
+            "stage": stage,
+            "reply_channel": approver.slack_user_id,
+        },
+    )
     db.commit()
-    db.refresh(updated)
-    return updated
+    db.refresh(request)
+    return request

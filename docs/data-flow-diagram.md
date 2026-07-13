@@ -13,7 +13,7 @@ Employees interact with the leave bot through natural Slack messages. The bot ca
 - Read the active leave policy and determine whether a document or HR approval is required.
 - Send an approval card to the employee's manager.
 - Record manager and HR decisions.
-- Preserve approval workflows when the API restarts.
+- Preserve accepted Slack events and approval workflows when the API restarts.
 - Maintain an auditable business record in PostgreSQL.
 
 ## 2. Deployed Components
@@ -72,6 +72,8 @@ The API is the business-logic boundary.
 Responsibilities:
 
 - Verifies Slack request signatures and timestamps.
+- Stores each Slack event with a unique idempotency key and acknowledges Slack immediately.
+- Runs a PostgreSQL-backed worker for inbound events and outbound side effects.
 - Loads employees and manager relationships.
 - Calls Groq to interpret natural messages.
 - Applies deterministic policy and permission checks.
@@ -147,7 +149,9 @@ It stores:
 - Policy versions.
 - Temporary fields collected across Slack messages.
 
-It contains exactly five application tables.
+It contains five business tables and one infrastructure table named `durable_jobs`.
+
+`durable_jobs` preserves accepted Slack events, AgentSpan operations, and outbound Slack messages. Jobs are retried with exponential backoff, stale processing locks are recovered after restarts, and exhausted jobs remain available for diagnosis.
 
 ### 2.6 S3-Compatible Bucket
 
@@ -275,6 +279,11 @@ Slack message
 POST /slack/events
   |
   +--> verify Slack signature
+  +--> insert process_slack_event job using Slack event_id
+  +--> return HTTP 200 to Slack
+  |
+  v
+durable worker
   |
   +--> load employee by slack_user_id
   |
@@ -294,16 +303,16 @@ POST /slack/events
                   create leave_requests row
                     |
                     v
-                  start AgentSpan execution
+                  queue start_agentspan job
+                    |
+                    v
+                  retry AgentSpan until execution starts
                     |
                     v
                   store agentspan_execution_id
                     |
                     v
-                  close conversation session
-                    |
-                    v
-                  send manager Slack approval card
+                  queue and retry manager Slack approval card
 ```
 
 `conversation_sessions` is needed because separate Slack messages are separate HTTP requests. AgentSpan handles the submitted approval workflow; it does not reliably correlate partially collected fields from unrelated Slack webhook requests.
@@ -317,6 +326,12 @@ Manager clicks Approve in Slack
 POST /slack/interactions
   |
   +--> verify Slack signature
+  +--> insert process_slack_interaction job
+  +--> return immediately
+  |
+  v
+durable worker
+  |
   +--> load approver employee
   +--> load leave request
   +--> verify approver is employee's manager
@@ -334,10 +349,10 @@ POST /slack/interactions
               - AgentSpan advances to hr_approval
               - leave_requests.status = pending_hr
               - approval_events manager approval inserted
-              - HR notification/routing is the next product feature
+              - active HR/admin users receive approval cards
 ```
 
-If AgentSpan cannot record the decision, the API does not update the business database. The manager receives a retry message.
+If AgentSpan cannot record the decision, the job retries and the business database remains unchanged. After the maximum attempts, the job is marked `dead` for investigation instead of being discarded.
 
 ## 7. Rejection Flow
 
@@ -521,6 +536,27 @@ Purpose: temporarily stores fields collected across multiple Slack messages.
 
 This table does not store complete Slack chat history. It stores only the structured fields required to finish the current request.
 
+### 10.6 `durable_jobs`
+
+Purpose: infrastructure queue for restart-safe and retryable work.
+
+| Field | Type | Required | Meaning |
+|---|---|---:|---|
+| `id` | integer | yes | Primary key. |
+| `job_type` | varchar(64) | yes | Handler such as `process_slack_event`, `start_agentspan`, or `send_slack_message`. |
+| `idempotency_key` | varchar(255) | yes | Unique stable key that suppresses duplicate delivery. |
+| `payload_json` | text | yes | Minimum data required to execute the job. |
+| `status` | varchar(32) | yes | `pending`, `processing`, `succeeded`, or `dead`. |
+| `attempts` | integer | yes | Number of times the job has been claimed. |
+| `max_attempts` | integer | yes | Retry limit. |
+| `available_at` | datetime | yes | Earliest time the worker may retry the job. |
+| `locked_at` | datetime | no | Claim time used to recover work after a worker crash. |
+| `last_error` | text | no | Most recent failure description. |
+| `created_at` | datetime | yes | Creation timestamp. |
+| `updated_at` | datetime | yes | Last state-change timestamp. |
+
+This table has no business foreign keys. Payloads carry identifiers, while each handler reloads and authorizes current business records before acting.
+
 ## 11. Text ERD
 
 ```text
@@ -582,6 +618,20 @@ This table does not store complete Slack chat history. It stores only the struct
 | created_by                  |     | status                      |
 | created_at                  |     | updated_at                  |
 +-----------------------------+     +-----------------------------+
+
++-----------------------------+
+| durable_jobs                |
+|-----------------------------|
+| PK id                       |
+| job_type                    |
+| UQ idempotency_key          |
+| payload_json                |
+| status                      |
+| attempts / max_attempts     |
+| available_at / locked_at    |
+| last_error                  |
+| created_at / updated_at     |
++-----------------------------+
 ```
 
 Relationship summary:
@@ -593,7 +643,7 @@ approval_events.request_id many events    -> one leave request
 approval_events.approver_id many events   -> one approver employee
 ```
 
-`leave_policy_versions` and `conversation_sessions` have no database foreign keys to the other tables. Policy versions are global, while conversation sessions are correlated through Slack user ID.
+`leave_policy_versions`, `conversation_sessions`, and `durable_jobs` have no database foreign keys to the other tables. Policy versions are global, conversation sessions are correlated through Slack user ID, and jobs reload referenced records before execution.
 
 ## 12. Data Ownership Rules
 
@@ -606,6 +656,7 @@ Partial request fields                   Leave PostgreSQL
 Policy and policy history                Leave PostgreSQL
 Leave request and final status           Leave PostgreSQL
 Business approval audit                  Leave PostgreSQL
+Accepted events and retry state          Leave PostgreSQL durable_jobs
 Durable approval execution state         AgentSpan PostgreSQL
 Natural-language extraction              Groq, no business ownership
 Document binary                          Future S3 bucket
@@ -636,7 +687,11 @@ The business status and approval event are not changed. The approver is told to 
 
 ### API restart
 
-Slack can call the restarted API, business data remains in PostgreSQL, and submitted approval workflows remain in AgentSpan.
+Business data and accepted Slack events remain in PostgreSQL. Pending or stale jobs are reclaimed by the restarted worker, and submitted approval workflows remain in AgentSpan.
+
+### Slack, Groq, or AgentSpan outage
+
+Groq failures use the deterministic parser fallback. Slack delivery and AgentSpan operations remain in `durable_jobs` and retry with bounded exponential backoff. A permanent failure is marked `dead` instead of being discarded.
 
 ### Duplicate or old approval action
 
@@ -663,6 +718,13 @@ AWS_ACCESS_KEY_ID         Future S3 authentication
 AWS_SECRET_ACCESS_KEY     Future S3 authentication
 AWS_REGION                Future S3 region
 S3_BUCKET_NAME            Future document bucket
+
+JOB_WORKER_ENABLED         Run the durable worker in the API process
+JOB_POLL_INTERVAL_SECONDS  Delay between empty queue polls
+JOB_LOCK_TIMEOUT_SECONDS   Time before a crashed worker's job is reclaimed
+JOB_MAX_ATTEMPTS           Maximum attempts before a job is marked dead
+DB_POOL_SIZE               PostgreSQL connection pool size
+DB_MAX_OVERFLOW            Additional temporary PostgreSQL connections
 ```
 
 Secrets must be stored in Railway variables or another secret manager and must not be committed to Git.
@@ -687,12 +749,10 @@ Not yet complete:
 - Selecting and notifying a designated HR approver in Slack.
 - Slack file ingestion and S3 document storage.
 - Document access, scanning, and retention controls.
-- Database migrations through Alembic instead of startup `create_all()`.
-- Slack event inbox/idempotency for exactly-once processing.
 - Cancellation and approved-request reversal workflows.
 - Production monitoring and alerts for failed AgentSpan executions.
 
-## 16. Why There Are Five Business Tables
+## 16. Why There Are Five Business Tables And One Job Table
 
 Each table has a separate business responsibility:
 
@@ -702,6 +762,7 @@ leave_requests         authoritative leave records and days taken
 approval_events        company approval audit
 leave_policy_versions  editable policy history
 conversation_sessions  partial fields across Slack webhook requests
+durable_jobs           infrastructure queue, retries, and idempotency
 ```
 
-AgentSpan's internal tables are not counted because they belong to a separate workflow service and separate database. No business report should query AgentSpan's internal database directly.
+`durable_jobs` is not business data and is excluded from leave reports. AgentSpan's internal tables are also not counted because they belong to a separate workflow service and separate database. No business report should query AgentSpan's internal database directly.

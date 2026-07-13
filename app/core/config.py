@@ -16,6 +16,13 @@ class Settings(BaseSettings):
     groq_model: str = "qwen/qwen3.6-27b"
     agentspan_server_url: str = ""
 
+    job_worker_enabled: bool = True
+    job_poll_interval_seconds: float = 0.5
+    job_lock_timeout_seconds: int = 300
+    job_max_attempts: int = 8
+    db_pool_size: int = 5
+    db_max_overflow: int = 5
+
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     aws_region: str = "us-east-1"

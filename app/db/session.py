@@ -19,9 +19,17 @@ def normalize_database_url(url: str) -> str:
 
 
 database_url = normalize_database_url(settings.database_url)
-connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
-engine = create_engine(database_url, connect_args=connect_args)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+is_sqlite = database_url.startswith("sqlite")
+connect_args = {"check_same_thread": False} if is_sqlite else {}
+engine_options = {
+    "connect_args": connect_args,
+    "pool_pre_ping": True,
+    "pool_recycle": 300,
+}
+if not is_sqlite:
+    engine_options.update(pool_size=settings.db_pool_size, max_overflow=settings.db_max_overflow)
+engine = create_engine(database_url, **engine_options)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -30,9 +38,3 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
-
-
-def create_all() -> None:
-    from app.db import models  # noqa: F401
-
-    Base.metadata.create_all(bind=engine)

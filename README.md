@@ -7,16 +7,17 @@ Current scope:
 - Slack workspace sync is the employee source.
 - Manager relationships come from an admin CSV.
 - Leave/document rules are placeholders in JSON config.
-- Slack, LLM, Agentspan, and S3 are adapter interfaces with local/mock implementations.
-- The API and database own business rules, permissions, balances, and audit history.
+- Slack events are acknowledged after they are durably queued in PostgreSQL.
+- Groq interprets messages, AgentSpan owns approval workflow checkpoints, and PostgreSQL owns business data.
+- Failed Slack and AgentSpan operations are retried with idempotency protection.
 
 ## Architecture
 
 ```text
-Slack -> API -> LLM parser
-             -> DB
-             -> local/S3 document storage
-             -> local/Agentspan approval workflow
+Slack -> API -> PostgreSQL durable_jobs -> worker -> Groq parser
+                                                -> business tables
+                                                -> AgentSpan
+                                                -> Slack replies/cards
 ```
 
 ## Local Setup
@@ -24,6 +25,7 @@ Slack -> API -> LLM parser
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -e ".[dev]"
+.\.venv\Scripts\python -m alembic upgrade head
 .\.venv\Scripts\python -m uvicorn app.main:app --reload
 ```
 
@@ -55,9 +57,9 @@ Production requests to `/admin/*` and `/prototype/*` must include the
 3. Employee sends a free-flow leave message.
 4. LLM parser extracts request fields.
 5. API validates policy, balance, permissions, and document requirement.
-6. API starts approval workflow.
-7. Manager/HR decisions update the request.
-8. Approved request writes a deduction to the balance ledger.
+6. A durable job starts the approval workflow and notifies the manager.
+7. Manager/HR decisions are processed idempotently through durable jobs.
+8. Approved requests are summed to report days taken.
 
 ## Slack Scopes To Request
 
