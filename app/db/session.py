@@ -20,7 +20,7 @@ def normalize_database_url(url: str) -> str:
 
 database_url = normalize_database_url(settings.database_url)
 is_sqlite = database_url.startswith("sqlite")
-connect_args = {"check_same_thread": False} if is_sqlite else {}
+connect_args = {"check_same_thread": False} if is_sqlite else {"prepare_threshold": None}
 engine_options = {
     "connect_args": connect_args,
     "pool_pre_ping": True,
