@@ -341,6 +341,12 @@ class RealSlackClient(SlackClient):
         self._post_message(channel=channel_id, text=text, blocks=blocks)
 
     def upload_csv(self, channel_id: str, filename: str, content: bytes, title: str) -> None:
+        if channel_id.startswith("U"):
+            conversation = self._api(
+                "conversations.open",
+                {"users": channel_id},
+            )
+            channel_id = conversation["channel"]["id"]
         upload = self._api(
             "files.getUploadURLExternal",
             {"filename": filename, "length": len(content)},

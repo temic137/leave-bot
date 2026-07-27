@@ -672,6 +672,8 @@ def test_slack_csv_export_uses_external_upload_flow(monkeypatch) -> None:
 
     def fake_api(method, payload, **kwargs):
         calls.append((method, payload, kwargs))
+        if method == "conversations.open":
+            return {"ok": True, "channel": {"id": "D_HR"}}
         if method == "files.getUploadURLExternal":
             return {"upload_url": "https://upload.example", "file_id": "F_REPORT"}
         return {"ok": True}
@@ -685,10 +687,11 @@ def test_slack_csv_export_uses_external_upload_flow(monkeypatch) -> None:
     client.upload_csv("U_HR", "report.csv", b"name,used\nAda,2\n", "Leave report")
 
     assert [call[0] for call in calls] == [
+        "conversations.open",
         "files.getUploadURLExternal",
         "files.completeUploadExternal",
     ]
-    assert calls[1][1]["channel_id"] == "U_HR"
+    assert calls[2][1]["channel_id"] == "D_HR"
 
 
 def test_employee_balance_search_is_workspace_scoped(db: Session) -> None:
