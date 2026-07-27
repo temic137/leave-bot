@@ -11,13 +11,14 @@ class EmployeeSyncService:
     def upsert_slack_user(self, slack_user_id: str, email: str, name: str, is_active: bool = True) -> Employee:
         employee = self.db.scalar(select(Employee).where(Employee.slack_user_id == slack_user_id))
         if employee is None:
-            employee = self.db.scalar(select(Employee).where(Employee.email == email))
-        if employee is None:
-            employee = Employee(slack_user_id=slack_user_id, email=email, name=name, is_active=is_active)
+            email_owner = self.db.scalar(select(Employee).where(Employee.email == email))
+            stored_email = email if email_owner is None else f"{slack_user_id.lower()}@slack-id.invalid"
+            employee = Employee(slack_user_id=slack_user_id, email=stored_email, name=name, is_active=is_active)
             self.db.add(employee)
         else:
-            employee.slack_user_id = slack_user_id
-            employee.email = email
+            email_owner = self.db.scalar(select(Employee).where(Employee.email == email))
+            if email_owner is None or email_owner.id == employee.id:
+                employee.email = email
             employee.name = name
             employee.is_active = is_active
         self.db.flush()

@@ -86,6 +86,27 @@ def test_slack_sync_refreshes_placeholder_email_without_losing_manager(db: Sessi
     assert synced.manager_id == manager.id
 
 
+def test_slack_sync_keeps_same_email_users_from_different_workspaces_separate(db: Session) -> None:
+    original = Employee(
+        slack_user_id="U_COMPANY",
+        email="employee@company.example",
+        name="Company Employee",
+    )
+    db.add(original)
+    db.flush()
+
+    test_user = EmployeeSyncService(db).upsert_slack_user(
+        "U_TEST",
+        "employee@company.example",
+        "Test Employee",
+    )
+
+    assert test_user.id != original.id
+    assert test_user.email == "u_test@slack-id.invalid"
+    assert original.slack_user_id == "U_COMPANY"
+    assert original.email == "employee@company.example"
+
+
 def test_manager_approval_deducts_balance_for_manager_only_leave(db: Session) -> None:
     employee, manager, _hr = seed_people(db)
     balances = BalanceService(db)
