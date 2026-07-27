@@ -31,7 +31,12 @@
     "How much leave do I have",
     "I want to see my leave balance",
     "Give me my leave usage",
-    "Check how many leave days I used"
+    "Check how many leave days I used",
+    "Show the leave balance of all employees",
+    "Show my team's leave balances",
+    "Find an employee's leave balance",
+    "Give me the employee leave report",
+    "Show leave balances by department"
   ],
   "leave_history": [
     "Show my leave history",

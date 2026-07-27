@@ -232,6 +232,10 @@ def admin_state(db: Session = Depends(get_db)) -> dict:
     requests = db.scalars(select(LeaveRequest).order_by(LeaveRequest.id.desc())).all()
     target_year = date.today().year
     balance_service = BalanceService(db)
+    grouped_balances = balance_service.get_taken_days_for_employees(
+        [employee.id for employee in employees],
+        target_year,
+    )
 
     return {
         "employees": [
@@ -246,7 +250,7 @@ def admin_state(db: Session = Depends(get_db)) -> dict:
                 "manager_id": employee.manager_id,
                 "manager_name": employee.manager.name if employee.manager else None,
                 "balances": {
-                    leave_type: balance_service.get_taken_days(employee.id, leave_type, target_year)
+                    leave_type: grouped_balances.get(employee.id, {}).get(leave_type, 0.0)
                     for leave_type in leave_policy.all()
                 },
             }
@@ -381,19 +385,46 @@ async def slack_interactions(
     form = parse_qs(raw_body.decode("utf-8"))
     payload = json.loads(form.get("payload", ["{}"])[0])
     if payload.get("type") == "view_submission":
+        callback_id = payload.get("view", {}).get("callback_id")
+        if callback_id == "employee_balance_search_submission":
+            return _submit_employee_balance_search(payload, db)
+        if callback_id == "department_balance_submission":
+            return _submit_department_balance(payload, db)
         return _submit_leave_modal(payload, db)
+    if payload.get("type") == "block_suggestion":
+        return _employee_balance_options(payload, db)
 
     action = (payload.get("actions") or [{}])[0]
-    if action.get("action_id") == "open_leave_request_modal":
+    action_id = action.get("action_id")
+    if action_id in {
+        "open_leave_request_modal",
+        "open_balance_employee_search",
+        "open_balance_department_filter",
+    }:
         user_id = payload.get("user", {}).get("id", "")
         employee = _employee_by_slack(db, user_id, payload.get("team", {}).get("id"))
         if employee is None:
             return _ephemeral("Your Slack account is not registered in the leave system.")
         trigger_id = payload.get("trigger_id")
         if not trigger_id:
-            return _ephemeral("Slack could not open the form. Please use `/leave-request`.")
-        _sync_policy_from_db(db)
-        RealSlackClient().open_leave_request_modal(trigger_id, leave_policy.all())
+            return _ephemeral("Slack could not open the requested form. Please try again.")
+        slack = RealSlackClient()
+        if action_id == "open_leave_request_modal":
+            _sync_policy_from_db(db)
+            slack.open_leave_request_modal(trigger_id, leave_policy.all())
+        elif employee.role not in {"manager", "hr", "admin"}:
+            return _ephemeral("Only managers and HR can search employee balances.")
+        elif action_id == "open_balance_employee_search":
+            slack.open_employee_balance_search_modal(trigger_id)
+        else:
+            departments = db.scalars(
+                _visible_employee_query(employee)
+                .with_only_columns(Employee.department)
+                .where(Employee.department.is_not(None))
+                .distinct()
+                .order_by(Employee.department)
+            ).all()
+            slack.open_department_balance_modal(trigger_id, departments)
         return {"ok": True}
 
     interaction_id = action.get("action_ts") or payload.get("trigger_id") or hashlib.sha256(raw_body).hexdigest()
@@ -404,7 +435,103 @@ async def slack_interactions(
         {"interaction": payload},
     )
     db.commit()
-    return {"response_type": "ephemeral", "text": "Processing your decision..."}
+    text = (
+        "Preparing your leave report..."
+        if action_id in {"balance_report_page", "download_balance_report"}
+        else "Processing your decision..."
+    )
+    return {"response_type": "ephemeral", "text": text}
+
+
+def _employee_balance_options(payload: dict, db: Session) -> dict:
+    if payload.get("action_id") != "balance_employee_search":
+        return {"options": []}
+    requester = _employee_by_slack(
+        db,
+        payload.get("user", {}).get("id", ""),
+        payload.get("team", {}).get("id"),
+    )
+    if requester is None or requester.role not in {"manager", "hr", "admin"}:
+        return {"options": []}
+    search = payload.get("value", "").strip()
+    query = _visible_employee_query(requester).order_by(Employee.name).limit(100)
+    if search:
+        query = query.where(Employee.name.ilike(f"%{search}%"))
+    employees = db.scalars(query).all()
+    return {
+        "options": [
+            {
+                "text": {"type": "plain_text", "text": employee.name[:75]},
+                "value": str(employee.id),
+            }
+            for employee in employees
+        ]
+    }
+
+
+def _submit_employee_balance_search(payload: dict, db: Session) -> dict:
+    _sync_policy_from_db(db)
+    requester = _employee_by_slack(
+        db,
+        payload.get("user", {}).get("id", ""),
+        payload.get("team", {}).get("id"),
+    )
+    selected = _modal_value(
+        payload.get("view", {}).get("state", {}).get("values", {}),
+        "employee",
+        "balance_employee_search",
+        "selected_option",
+        "value",
+    )
+    try:
+        selected_id = int(selected)
+    except (TypeError, ValueError):
+        selected_id = None
+    target = (
+        db.scalar(_visible_employee_query(requester).where(Employee.id == selected_id))
+        if requester and selected_id
+        else None
+    )
+    if target is None:
+        return _modal_errors({"employee": "Choose an employee you are allowed to view."})
+    enqueue_job(
+        db,
+        "send_slack_message",
+        f"balance-search:{payload.get('view', {}).get('id')}",
+        {"channel": requester.slack_user_id, "text": _balance_result(db, target)["reply"]},
+    )
+    db.commit()
+    return {"response_action": "clear"}
+
+
+def _submit_department_balance(payload: dict, db: Session) -> dict:
+    requester = _employee_by_slack(
+        db,
+        payload.get("user", {}).get("id", ""),
+        payload.get("team", {}).get("id"),
+    )
+    if requester is None or requester.role not in {"manager", "hr", "admin"}:
+        return _modal_errors({"department": "You are not allowed to view employee balances."})
+    department = _modal_value(
+        payload.get("view", {}).get("state", {}).get("values", {}),
+        "department",
+        "balance_department_select",
+        "selected_option",
+        "value",
+    )
+    enqueue_job(
+        db,
+        "send_balance_report_page",
+        f"balance-department:{payload.get('view', {}).get('id')}",
+        {
+            "channel": requester.slack_user_id,
+            "requester_id": requester.id,
+            "department": None if department == "__all__" else department,
+            "page": 0,
+        },
+    )
+    db.commit()
+    return {"response_action": "clear"}
 
 
 def _submit_leave_modal(payload: dict, db: Session) -> dict:
@@ -465,7 +592,9 @@ def _submit_leave_modal(payload: dict, db: Session) -> dict:
             )
         )
     except ValueError as exc:
-        return _modal_errors({"leave_type": str(exc)})
+        message = str(exc)
+        field = "start_date" if "overlap" in message.lower() or "working days" in message.lower() else "leave_type"
+        return _modal_errors({field: message})
 
     db.flush()
     if document_id:
@@ -568,7 +697,7 @@ def _process_chat(payload: ChatIn, db: Session) -> dict:
         "type": "employee_menu",
         "reply": (
             "Choose an action below. *Request leave* opens the leave form. "
-            "*Check balance* shows your approved days taken. "
+            "*Check balance* shows allocated, used, and remaining days. "
             "*View history* shows your recent leave requests."
         ),
     }
@@ -597,17 +726,31 @@ def _strip_bot_mention(text: str) -> str:
 
 
 def _taken_balances(db: Session, employee: Employee) -> dict[str, float]:
-    balance_service = BalanceService(db)
-    target_year = date.today().year
-    return {
-        leave_type: balance_service.get_taken_days(employee.id, leave_type, target_year)
-        for leave_type in leave_policy.all()
-    }
+    grouped = BalanceService(db).get_taken_days_for_employees([employee.id], date.today().year)
+    return {leave_type: grouped.get(employee.id, {}).get(leave_type, 0.0) for leave_type in leave_policy.all()}
 
 
 def _format_balance_reply(employee: Employee, balances: dict[str, float]) -> str:
-    rows = "\n".join(f"*{leave_name(leave_type)}:* {days:g} days taken" for leave_type, days in balances.items())
-    return f"*Leave taken for {employee.name} in {date.today().year}*\n{rows}"
+    rows = []
+    for leave_type, used in balances.items():
+        allocated = leave_policy.get(leave_type).annual_days
+        remaining = allocated - used
+        filled = 10 if allocated == 0 and used else round(min(used / allocated, 1) * 10) if allocated else 0
+        rows.append(
+            f"*{leave_name(leave_type)}:* {used:g} used / {allocated:g} allocated / {remaining:g} remaining\n"
+            f"`[{'#' * filled}{'-' * (10 - filled)}]`"
+        )
+    return f"*Leave balance for {employee.name} in {date.today().year}*\n" + "\n".join(rows)
+
+
+def _format_compact_balance(employee: Employee, balances: dict[str, float]) -> str:
+    values = []
+    for leave_type, used in balances.items():
+        allocated = leave_policy.get(leave_type).annual_days
+        values.append(
+            f"{leave_name(leave_type)}: {used:g}/{allocated:g} used, {allocated - used:g} remaining"
+        )
+    return f"*{employee.name}*\n" + " | ".join(values)
 
 
 def _balance_result(db: Session, employee: Employee) -> dict:
@@ -624,22 +767,14 @@ def _balance_result_for_query(db: Session, requester: Employee, text: str) -> di
     if requester.role not in {"manager", "hr", "admin"}:
         return _balance_result(db, requester)
 
-    query = select(Employee).where(
-        Employee.is_active.is_(True),
-        Employee.id != requester.id,
-        Employee.workspace_id == requester.workspace_id,
-    )
-    if requester.role == "manager":
-        query = query.where(Employee.manager_id == requester.id)
-    visible = db.scalars(query.order_by(Employee.name)).all()
-
-    team_words = ("team", "direct report", "employees", "everyone", "all balance")
+    team_words = ("team", "direct report", "employees", "everyone", "all balance", "all employee")
     if any(word in normalized for word in team_words):
-        if not visible:
+        count = db.scalar(select(func.count()).select_from(_visible_employee_query(requester).subquery())) or 0
+        if not count:
             return {"type": "balance", "reply": "You do not have any employees whose balance you can view."}
-        rows = [_format_balance_reply(person, _taken_balances(db, person)) for person in visible]
-        return {"type": "balance", "reply": "*Employee leave taken this year*\n\n" + "\n\n".join(rows)}
+        return _balance_report_menu_result(count)
 
+    visible = db.scalars(_visible_employee_query(requester).order_by(Employee.name)).all()
     matches = [
         person
         for person in visible
@@ -656,12 +791,84 @@ def _balance_result_for_query(db: Session, requester: Employee, text: str) -> di
     target_words = ("employee", "report", "staff member", "his", "her", "their", "someone")
     asks_for_self = bool(re.search(r"\b(my|mine)\b", normalized))
     if visible and (any(word in normalized for word in target_words) or not asks_for_self):
-        names = ", ".join(person.name for person in visible)
         return {
-            "type": "balance_clarification",
-            "reply": f"*Which employee do you mean?*\nPlease use the employee's name. You can ask about: {names}.",
+            **_balance_report_menu_result(len(visible)),
+            "reply": (
+                "*Which employee do you mean?*\n"
+                "Please use the employee's name or click *Search employee* below."
+            ),
         }
     return _balance_result(db, requester)
+
+
+def _visible_employee_query(requester: Employee):
+    query = select(Employee).where(
+        Employee.is_active.is_(True),
+        Employee.id != requester.id,
+        Employee.workspace_id == requester.workspace_id,
+    )
+    if requester.role == "manager":
+        query = query.where(Employee.manager_id == requester.id)
+    return query
+
+
+def _balance_report_menu_result(employee_count: int) -> dict:
+    return {
+        "type": "balance_report_menu",
+        "reply": (
+            f"*Employee leave report*\n"
+            f"*Employees:* {employee_count}\n"
+            f"*Year:* {date.today().year}\n\n"
+            "*Search employee* opens a name search. "
+            "*View by department* shows 10 employees at a time. "
+            "*Download CSV* creates the complete report."
+        ),
+    }
+
+
+def _balance_report_page_result(
+    db: Session,
+    requester: Employee,
+    department: str | None,
+    page: int,
+    page_size: int = 10,
+) -> dict:
+    query = _visible_employee_query(requester)
+    if department:
+        query = query.where(Employee.department == department)
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(max(page, 0), total_pages - 1)
+    employees = db.scalars(
+        query.order_by(Employee.name).offset(page * page_size).limit(page_size)
+    ).all()
+    grouped = BalanceService(db).get_taken_days_for_employees(
+        [employee.id for employee in employees],
+        date.today().year,
+    )
+    rows = [
+        _format_compact_balance(
+            employee,
+            {
+                leave_type: grouped.get(employee.id, {}).get(leave_type, 0.0)
+                for leave_type in leave_policy.all()
+            },
+        )
+        for employee in employees
+    ]
+    heading = department or "All employees"
+    text = (
+        f"*{heading} leave report*\n"
+        f"*Page:* {page + 1} of {total_pages} | *Employees:* {total}\n\n"
+        + ("\n\n".join(rows) if rows else "No employees found.")
+    )
+    return {
+        "type": "balance_report_page",
+        "reply": text,
+        "department": department,
+        "page": page,
+        "total_pages": total_pages,
+    }
 
 
 def _pending_requests_result(db: Session, requester: Employee) -> dict:
@@ -806,6 +1013,7 @@ def get_employee_balance(
     year: int | None = None,
     db: Session = Depends(get_db),
 ) -> BalanceRead:
+    _sync_policy_from_db(db)
     requester = db.scalar(select(Employee).where(Employee.slack_user_id == requester_slack_user_id))
     target = db.get(Employee, employee_id)
     if requester is None or target is None:
@@ -815,11 +1023,15 @@ def get_employee_balance(
 
     target_year = year or date.today().year
     balance_service = BalanceService(db)
+    allocated = balance_service.get_allocated_days(employee_id, leave_type, target_year)
+    taken = balance_service.get_taken_days(employee_id, leave_type, target_year)
     return BalanceRead(
         employee_id=employee_id,
         leave_type=leave_type,
         year=target_year,
-        taken_days=balance_service.get_taken_days(employee_id, leave_type, target_year),
+        allocated_days=allocated,
+        taken_days=taken,
+        remaining_days=allocated - taken,
     )
 
 

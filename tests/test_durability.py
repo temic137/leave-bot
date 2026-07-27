@@ -374,7 +374,7 @@ def test_leave_submission_runs_end_to_end_through_queue(tmp_path, monkeypatch) -
         employee = Employee(slack_user_id="U_EMPLOYEE", email="employee@example.com", name="Employee", manager=manager)
         db.add_all([manager, employee])
         db.flush()
-        start_date = date.today() + timedelta(days=5)
+        start_date = date.today() + timedelta(days=7)
         end_date = start_date + timedelta(days=1)
         submission = {
             "type": "view_submission",
@@ -443,7 +443,7 @@ def test_document_leave_uploads_before_manager_is_notified(tmp_path, monkeypatch
         employee = Employee(slack_user_id="U_EMPLOYEE", email="employee@example.com", name="Employee", manager=manager)
         db.add_all([manager, employee])
         db.flush()
-        start_date = date.today() + timedelta(days=5)
+        start_date = date.today() + timedelta(days=7)
         submission = {
             "type": "view_submission",
             "user": {"id": "U_EMPLOYEE"},

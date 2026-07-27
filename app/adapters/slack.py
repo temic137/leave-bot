@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import json
 
 import httpx
 
@@ -76,11 +77,157 @@ class RealSlackClient(SlackClient):
     def send_employee_menu(self, channel_id: str, text: str) -> None:
         self._post_message(channel=channel_id, text=text, blocks=self._employee_action_blocks(text))
 
+    def send_balance_report_menu(self, channel_id: str, text: str) -> None:
+        self._post_message(
+            channel=channel_id,
+            text=text,
+            blocks=[
+                {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Search employee"},
+                            "style": "primary",
+                            "action_id": "open_balance_employee_search",
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "View by department"},
+                            "action_id": "open_balance_department_filter",
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Download CSV"},
+                            "action_id": "download_balance_report",
+                            "value": "current_year",
+                        },
+                    ],
+                },
+            ],
+        )
+
+    def open_employee_balance_search_modal(self, trigger_id: str) -> None:
+        self._api(
+            "views.open",
+            {
+                "trigger_id": trigger_id,
+                "view": {
+                    "type": "modal",
+                    "callback_id": "employee_balance_search_submission",
+                    "title": {"type": "plain_text", "text": "Find employee"},
+                    "submit": {"type": "plain_text", "text": "Show balance"},
+                    "close": {"type": "plain_text", "text": "Cancel"},
+                    "blocks": [
+                        {
+                            "type": "input",
+                            "block_id": "employee",
+                            "label": {"type": "plain_text", "text": "Employee"},
+                            "element": {
+                                "type": "external_select",
+                                "action_id": "balance_employee_search",
+                                "min_query_length": 1,
+                                "placeholder": {"type": "plain_text", "text": "Type an employee name"},
+                            },
+                        }
+                    ],
+                },
+            },
+        )
+
+    def open_department_balance_modal(self, trigger_id: str, departments: list[str]) -> None:
+        options = [
+            {"text": {"type": "plain_text", "text": "All employees"}, "value": "__all__"},
+            *[
+                {"text": {"type": "plain_text", "text": department[:75]}, "value": department[:150]}
+                for department in departments[:99]
+            ],
+        ]
+        self._api(
+            "views.open",
+            {
+                "trigger_id": trigger_id,
+                "view": {
+                    "type": "modal",
+                    "callback_id": "department_balance_submission",
+                    "title": {"type": "plain_text", "text": "Employee balances"},
+                    "submit": {"type": "plain_text", "text": "Show report"},
+                    "close": {"type": "plain_text", "text": "Cancel"},
+                    "blocks": [
+                        {
+                            "type": "input",
+                            "block_id": "department",
+                            "label": {"type": "plain_text", "text": "Department"},
+                            "element": {
+                                "type": "static_select",
+                                "action_id": "balance_department_select",
+                                "options": options,
+                            },
+                        }
+                    ],
+                },
+            },
+        )
+
+    def send_balance_report_page(
+        self,
+        channel_id: str,
+        text: str,
+        department: str | None,
+        page: int,
+        total_pages: int,
+    ) -> None:
+        buttons = []
+        if page > 0:
+            buttons.append(
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Previous"},
+                    "action_id": "balance_report_page",
+                    "value": json.dumps({"department": department, "page": page - 1}),
+                }
+            )
+        if page + 1 < total_pages:
+            buttons.append(
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Next"},
+                    "action_id": "balance_report_page",
+                    "value": json.dumps({"department": department, "page": page + 1}),
+                }
+            )
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+        if buttons:
+            blocks.append({"type": "actions", "elements": buttons})
+        self._post_message(channel=channel_id, text=text, blocks=blocks)
+
+    def upload_csv(self, channel_id: str, filename: str, content: bytes, title: str) -> None:
+        upload = self._api(
+            "files.getUploadURLExternal",
+            {"filename": filename, "length": len(content)},
+            form_encoded=True,
+        )
+        response = httpx.post(
+            upload["upload_url"],
+            files={"file": (filename, content, "text/csv")},
+            timeout=30,
+        )
+        response.raise_for_status()
+        self._api(
+            "files.completeUploadExternal",
+            {
+                "files": [{"id": upload["file_id"], "title": title}],
+                "channel_id": channel_id,
+            },
+        )
+
     def publish_employee_home(self, slack_user_id: str) -> None:
         text = (
             "*Leave bot*\n"
             "Request leave opens a form for your leave type and dates. "
-            "Check balance shows approved days taken. View history shows your recent requests."
+            "Check balance shows allocated, used, and remaining days. "
+            "View history shows your recent requests."
         )
         self._api(
             "views.publish",

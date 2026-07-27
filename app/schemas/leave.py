@@ -31,4 +31,6 @@ class BalanceRead(BaseModel):
     employee_id: int
     leave_type: str
     year: int
+    allocated_days: float
     taken_days: float
+    remaining_days: float

@@ -11,6 +11,8 @@ chat:write
 im:write
 im:history
 commands
+files:read
+files:write
 ```
 
 ## Why These Are Needed
@@ -30,10 +32,13 @@ commands
 `commands`
 : Register the leave slash commands.
 
-## Optional Later
-
 `files:read`
-: Download employee documents from Slack before storing them in S3 or local storage.
+: Download employee documents from Slack before storing them in managed storage.
+
+`files:write`
+: Upload complete employee leave balance CSV reports to the requesting manager or HR user.
+
+## Optional Later
 
 `im:read`, `app_mentions:read`, `channels:history`
 : Only needed for extra DM metadata or channel use. `app_mentions:read` is

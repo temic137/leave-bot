@@ -6,7 +6,7 @@ import time
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api import routes
@@ -14,13 +14,15 @@ from app.main import app
 from app.adapters.slack import RealSlackClient
 from app.adapters.storage import validate_document
 from app.adapters.workflow import AgentSpanApprovalWorkflow
-from app.db.models import Employee, LeavePolicyVersion, LeaveRequest, LeaveRequestStatus
+from app.db.models import DurableJob, Employee, LeavePolicyVersion, LeaveRequest, LeaveRequestStatus
 from app.db.session import Base
 from app.schemas.leave import LeaveRequestCreate
 from app.services.balances import BalanceService
+from app.services.dates import calculate_leave_days
 from app.services.employee_sync import EmployeeSyncService
 from app.services.leave_requests import LeaveRequestService
 from app.services.intents import IntentRouter
+from app.services import job_handlers
 from app.services.permissions import can_approve_request, can_view_balance
 from app.services.policy import LeavePolicy
 
@@ -155,7 +157,7 @@ def test_hr_required_leave_waits_after_manager_approval(db: Session) -> None:
     db.flush()
 
     assert request.status == LeaveRequestStatus.approved.value
-    assert balances.get_taken_days(employee.id, "maternity", 2026) == 3.0
+    assert balances.get_taken_days(employee.id, "maternity", 2026) == 1.0
 
 
 def test_document_required_leave_rejects_missing_document(db: Session) -> None:
@@ -467,13 +469,13 @@ def test_manager_can_ask_for_direct_report_balance(db: Session) -> None:
     result = routes._balance_result_for_query(db, manager, "show Employee's leave balance")
 
     assert result["type"] == "balance"
-    assert "Leave taken for Employee" in result["reply"]
-    assert "*Annual Leave:* 2 days taken" in result["reply"]
+    assert "Leave balance for Employee" in result["reply"]
+    assert "*Annual Leave:* 2 used / 20 allocated / 18 remaining" in result["reply"]
 
     pronoun_result = routes._balance_result_for_query(db, manager, "show me his balance")
-    assert pronoun_result["type"] == "balance_clarification"
+    assert pronoun_result["type"] == "balance_report_menu"
     assert "Which employee do you mean?" in pronoun_result["reply"]
-    assert "Employee" in pronoun_result["reply"]
+    assert "Search employee" in pronoun_result["reply"]
 
 
 def test_hr_can_view_all_pending_requests(db: Session) -> None:
@@ -523,3 +525,226 @@ def test_hr_views_are_limited_to_their_workspace(db: Session) -> None:
 
     assert "Outside Employee" not in balances["reply"]
     assert "Outside Employee" not in pending["reply"]
+
+
+def test_leave_days_exclude_weekends() -> None:
+    assert calculate_leave_days(date(2026, 7, 10), date(2026, 7, 13)) == 2
+
+
+def test_request_rejects_overlap_and_insufficient_remaining_days(db: Session) -> None:
+    employee, _manager, _hr = seed_people(db)
+    db.add(
+        LeaveRequest(
+            employee_id=employee.id,
+            leave_type="annual",
+            start_date=date(2026, 7, 1),
+            end_date=date(2026, 7, 1),
+            days_requested=19,
+            status=LeaveRequestStatus.approved.value,
+        )
+    )
+    db.flush()
+
+    with pytest.raises(ValueError, match="only 1 days remain"):
+        LeaveRequestService(db).create_request(
+            LeaveRequestCreate(
+                employee_id=employee.id,
+                leave_type="annual",
+                start_date=date(2026, 7, 6),
+                end_date=date(2026, 7, 7),
+            )
+        )
+
+    db.add(
+        LeaveRequest(
+            employee_id=employee.id,
+            leave_type="annual",
+            start_date=date(2026, 7, 13),
+            end_date=date(2026, 7, 15),
+            days_requested=3,
+            status=LeaveRequestStatus.pending_manager.value,
+        )
+    )
+    db.flush()
+    with pytest.raises(ValueError, match="overlap"):
+        LeaveRequestService(db).create_request(
+            LeaveRequestCreate(
+                employee_id=employee.id,
+                leave_type="annual",
+                start_date=date(2026, 7, 14),
+                end_date=date(2026, 7, 14),
+            )
+        )
+
+
+def test_large_employee_report_is_compact_and_grouped(db: Session) -> None:
+    hr = Employee(
+        workspace_id="T_LARGE",
+        slack_user_id="U_LARGE_HR",
+        email="large.hr@example.com",
+        name="Large HR",
+        role="hr",
+    )
+    employees = [
+        Employee(
+            workspace_id="T_LARGE",
+            slack_user_id=f"U_{index:03}",
+            email=f"employee{index:03}@example.com",
+            name=f"Employee {index:03}",
+            department="Operations" if index < 50 else "Sales",
+        )
+        for index in range(100)
+    ]
+    db.add_all([hr, *employees])
+    db.flush()
+    db.add_all(
+        [
+            LeaveRequest(
+                employee_id=employee.id,
+                leave_type="annual",
+                start_date=date(2026, 7, 6),
+                end_date=date(2026, 7, 6),
+                days_requested=1,
+                status=LeaveRequestStatus.approved.value,
+            )
+            for employee in employees
+        ]
+    )
+    db.flush()
+
+    menu = routes._balance_result_for_query(db, hr, "show all employee balances")
+    assert menu["type"] == "balance_report_menu"
+    assert "*Employees:* 100" in menu["reply"]
+    assert "Employee 099" not in menu["reply"]
+
+    statements = []
+    listener = lambda *args: statements.append(args[2])
+    event.listen(db.bind, "before_cursor_execute", listener)
+    try:
+        grouped = BalanceService(db).get_taken_days_for_employees(
+            [employee.id for employee in employees],
+            2026,
+        )
+    finally:
+        event.remove(db.bind, "before_cursor_execute", listener)
+    assert len(statements) == 1
+    assert grouped[employees[0].id]["annual"] == 1
+
+    page = routes._balance_report_page_result(db, hr, "Operations", 0)
+    assert page["total_pages"] == 5
+    assert "Employee 000" in page["reply"]
+    assert "Employee 009" in page["reply"]
+    assert "Employee 010" not in page["reply"]
+    assert len(page["reply"]) < 3000
+
+
+def test_balance_report_menu_explains_its_buttons(monkeypatch) -> None:
+    sent = {}
+    client = RealSlackClient(token="test-token")
+    monkeypatch.setattr(
+        client,
+        "_api",
+        lambda method, payload: sent.update({"method": method, "payload": payload}) or {"ok": True},
+    )
+
+    client.send_balance_report_menu("U_HR", "Employee report")
+
+    actions = sent["payload"]["blocks"][1]["elements"]
+    assert [action["action_id"] for action in actions] == [
+        "open_balance_employee_search",
+        "open_balance_department_filter",
+        "download_balance_report",
+    ]
+
+
+def test_slack_csv_export_uses_external_upload_flow(monkeypatch) -> None:
+    calls = []
+    client = RealSlackClient(token="test-token")
+
+    def fake_api(method, payload, **kwargs):
+        calls.append((method, payload, kwargs))
+        if method == "files.getUploadURLExternal":
+            return {"upload_url": "https://upload.example", "file_id": "F_REPORT"}
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_api", fake_api)
+    monkeypatch.setattr(
+        "app.adapters.slack.httpx.post",
+        lambda *args, **kwargs: type("Response", (), {"raise_for_status": lambda self: None})(),
+    )
+
+    client.upload_csv("U_HR", "report.csv", b"name,used\nAda,2\n", "Leave report")
+
+    assert [call[0] for call in calls] == [
+        "files.getUploadURLExternal",
+        "files.completeUploadExternal",
+    ]
+    assert calls[1][1]["channel_id"] == "U_HR"
+
+
+def test_employee_balance_search_is_workspace_scoped(db: Session) -> None:
+    _employee, _manager, hr = seed_people(db)
+    hr.workspace_id = "T_TEST"
+    teammate = Employee(
+        workspace_id="T_TEST",
+        slack_user_id="U_ADA",
+        email="ada@example.com",
+        name="Ada Teammate",
+    )
+    outsider = Employee(
+        workspace_id="T_OTHER",
+        slack_user_id="U_ADA_OTHER",
+        email="ada.other@example.com",
+        name="Ada Outsider",
+    )
+    db.add_all([teammate, outsider])
+    db.flush()
+
+    result = routes._employee_balance_options(
+        {
+            "action_id": "balance_employee_search",
+            "user": {"id": hr.slack_user_id},
+            "team": {"id": "T_TEST"},
+            "value": "Ada",
+        },
+        db,
+    )
+
+    assert [option["text"]["text"] for option in result["options"]] == ["Ada Teammate"]
+
+
+def test_csv_report_contains_only_authorized_employees(db: Session, monkeypatch) -> None:
+    employee, _manager, hr = seed_people(db)
+    employee.workspace_id = hr.workspace_id = "T_TEST"
+    outsider = Employee(
+        workspace_id="T_OTHER",
+        slack_user_id="U_OUTSIDE_CSV",
+        email="outside.csv@example.com",
+        name="Outside CSV",
+    )
+    db.add(outsider)
+    db.flush()
+    captured = {}
+    monkeypatch.setattr(
+        "app.adapters.slack.RealSlackClient.upload_csv",
+        lambda self, channel, filename, content, title: captured.update(
+            {"channel": channel, "filename": filename, "content": content.decode("utf-8-sig")}
+        ),
+    )
+    job = DurableJob(
+        id=99,
+        job_type="send_balance_report_csv",
+        idempotency_key="csv-test",
+        payload_json="{}",
+    )
+
+    job_handlers._send_balance_report_csv(
+        db,
+        job,
+        {"channel": hr.slack_user_id, "requester_id": hr.id},
+    )
+
+    assert captured["channel"] == hr.slack_user_id
+    assert "Employee" in captured["content"]
+    assert "Annual Leave" in captured["content"]
+    assert "Outside CSV" not in captured["content"]

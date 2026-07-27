@@ -1,3 +1,6 @@
+import csv
+from datetime import date
+import io
 import json
 import logging
 
@@ -26,6 +29,9 @@ def handle_job(db: Session, job: DurableJob) -> None:
         "send_slack_message": _send_slack_message,
         "send_leave_request_prompt": _send_leave_request_prompt,
         "send_employee_menu": _send_employee_menu,
+        "send_balance_report_menu": _send_balance_report_menu,
+        "send_balance_report_page": _send_balance_report_page,
+        "send_balance_report_csv": _send_balance_report_csv,
         "publish_employee_home": _publish_employee_home,
         "send_approval_card": _send_approval_card,
         "upload_leave_document": _upload_leave_document,
@@ -79,7 +85,12 @@ def _process_slack_event(db: Session, job: DurableJob, payload: dict) -> None:
 
 
 def _process_slack_interaction(db: Session, job: DurableJob, payload: dict) -> None:
-    from app.api.routes import _balance_result, _handle_chat_approval, _history_result
+    from app.api.routes import (
+        _balance_report_page_result,
+        _balance_result,
+        _handle_chat_approval,
+        _history_result,
+    )
 
     interaction = payload["interaction"]
     user_id = interaction.get("user", {}).get("id")
@@ -103,6 +114,45 @@ def _process_slack_interaction(db: Session, job: DurableJob, payload: dict) -> N
         return
     if action_id == "view_leave_history":
         _queue_chat_result(db, job, user_id, _history_result(db, employee))
+        return
+    if action_id in {"balance_report_page", "download_balance_report"} and employee.role not in {
+        "manager",
+        "hr",
+        "admin",
+    }:
+        _queue_message(
+            db,
+            f"balance-report-denied:{job.id}",
+            user_id,
+            "Only managers and HR can view employee balance reports.",
+        )
+        return
+    if action_id == "balance_report_page":
+        try:
+            selection = json.loads(request_id or "{}")
+        except json.JSONDecodeError as exc:
+            raise PermanentJobError("Invalid balance report page") from exc
+        result = _balance_report_page_result(
+            db,
+            employee,
+            selection.get("department"),
+            int(selection.get("page", 0)),
+        )
+        _queue_chat_result(db, job, user_id, result)
+        return
+    if action_id == "download_balance_report":
+        enqueue_job(
+            db,
+            "send_balance_report_csv",
+            f"balance-csv:{job.id}",
+            {"channel": user_id, "requester_id": employee.id},
+        )
+        _queue_message(
+            db,
+            f"balance-csv-started:{job.id}",
+            user_id,
+            "I am preparing your employee leave report as a CSV file.",
+        )
         return
     if not request_id or action_id not in {"approve_leave", "reject_leave"}:
         raise PermanentJobError("Invalid Slack interaction")
@@ -128,6 +178,29 @@ def _queue_chat_result(db: Session, source_job: DurableJob, reply_channel: str, 
             "send_employee_menu",
             f"chat-reply:{source_job.id}",
             {"channel": reply_channel, "text": result["reply"]},
+        )
+        return
+    if result.get("type") == "balance_report_menu":
+        enqueue_job(
+            db,
+            "send_balance_report_menu",
+            f"chat-reply:{source_job.id}",
+            {"channel": reply_channel, "text": result["reply"]},
+        )
+        return
+    if result.get("type") == "balance_report_page":
+        enqueue_job(
+            db,
+            "send_balance_report_page",
+            f"chat-reply:{source_job.id}",
+            {
+                "channel": reply_channel,
+                "requester_id": result.get("requester_id"),
+                "department": result["department"],
+                "page": result["page"],
+                "text": result["reply"],
+                "total_pages": result["total_pages"],
+            },
         )
         return
 
@@ -277,6 +350,93 @@ def _send_leave_request_prompt(db: Session, job: DurableJob, payload: dict) -> N
 
 def _send_employee_menu(db: Session, job: DurableJob, payload: dict) -> None:
     RealSlackClient().send_employee_menu(payload["channel"], payload["text"])
+
+
+def _send_balance_report_menu(db: Session, job: DurableJob, payload: dict) -> None:
+    RealSlackClient().send_balance_report_menu(payload["channel"], payload["text"])
+
+
+def _send_balance_report_page(db: Session, job: DurableJob, payload: dict) -> None:
+    from app.api.routes import _balance_report_page_result, _sync_policy_from_db
+
+    if "text" not in payload:
+        requester = db.get(Employee, payload["requester_id"])
+        if requester is None:
+            raise PermanentJobError("Balance report requester no longer exists")
+        _sync_policy_from_db(db)
+        result = _balance_report_page_result(
+            db,
+            requester,
+            payload.get("department"),
+            int(payload.get("page", 0)),
+        )
+    else:
+        result = {
+            "reply": payload["text"],
+            "department": payload.get("department"),
+            "page": payload["page"],
+            "total_pages": payload["total_pages"],
+        }
+    RealSlackClient().send_balance_report_page(
+        payload["channel"],
+        result["reply"],
+        result["department"],
+        result["page"],
+        result["total_pages"],
+    )
+
+
+def _send_balance_report_csv(db: Session, job: DurableJob, payload: dict) -> None:
+    from app.api.routes import _sync_policy_from_db, _visible_employee_query
+    from app.services.balances import BalanceService
+    from app.services.policy import leave_policy
+
+    requester = db.get(Employee, payload["requester_id"])
+    if requester is None or requester.role not in {"manager", "hr", "admin"}:
+        raise PermanentJobError("Balance report requester is not authorized")
+    _sync_policy_from_db(db)
+    employees = db.scalars(_visible_employee_query(requester).order_by(Employee.name)).all()
+    year = date.today().year
+    grouped = BalanceService(db).get_taken_days_for_employees(
+        [employee.id for employee in employees],
+        year,
+    )
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(
+        ["employee", "email", "department", "leave_type", "allocated_days", "used_days", "remaining_days", "year"]
+    )
+    for employee in employees:
+        for leave_type, rule in leave_policy.all().items():
+            used = grouped.get(employee.id, {}).get(leave_type, 0.0)
+            writer.writerow(
+                [
+                    employee.name,
+                    employee.email,
+                    employee.department or "",
+                    rule.display_name,
+                    rule.annual_days,
+                    used,
+                    rule.annual_days - used,
+                    year,
+                ]
+            )
+    try:
+        RealSlackClient().upload_csv(
+            payload["channel"],
+            f"employee-leave-balances-{year}.csv",
+            output.getvalue().encode("utf-8-sig"),
+            f"Employee leave balances for {year}",
+        )
+    except RuntimeError as exc:
+        if "missing_scope" not in str(exc):
+            raise
+        _queue_message(
+            db,
+            f"balance-csv-scope:{job.id}",
+            payload["channel"],
+            "CSV export needs the Slack `files:write` permission. Ask the app administrator to add it and reinstall the app.",
+        )
 
 
 def _publish_employee_home(db: Session, job: DurableJob, payload: dict) -> None:
