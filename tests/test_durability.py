@@ -409,7 +409,7 @@ def test_leave_submission_runs_end_to_end_through_queue(tmp_path, monkeypatch) -
         assert request.agentspan_execution_id == "workflow-e2e"
         assert request.status == "pending_manager"
         assert db.scalar(select(func.count()).select_from(DurableJob).where(DurableJob.status != "succeeded")) == 0
-    assert any(channel == "U_EMPLOYEE" and "was submitted" in message for channel, message in sent_messages)
+    assert any(channel == "U_EMPLOYEE" and "was sent to Manager" in message for channel, message in sent_messages)
     assert sent_cards[0][0] == "U_MANAGER"
 
 
@@ -477,7 +477,8 @@ def test_document_leave_uploads_before_manager_is_notified(tmp_path, monkeypatch
         assert request.agentspan_execution_id == "workflow-document"
     assert any("document" in message.lower() and "uploaded" in message.lower() for _, message in sent_messages)
     assert sent_cards[0][0] == "U_MANAGER"
-    assert sent_cards[0][-1] == "https://storage.example/proof.pdf"
+    assert sent_cards[0][-2] == "https://storage.example/proof.pdf"
+    assert sent_cards[0][-1] == "Medical appointment"
 
 
 def test_hr_approval_card_stays_in_employee_workspace(tmp_path, monkeypatch) -> None:

@@ -24,6 +24,7 @@ from app.services.leave_requests import LeaveRequestService
 from app.services.jobs import enqueue_job
 from app.services.permissions import can_approve_request, can_view_balance
 from app.services.policy import leave_policy
+from app.services.presentation import leave_name, readable_date, readable_status
 
 
 router = APIRouter()
@@ -345,18 +346,7 @@ async def slack_commands(
         return _ephemeral(_history_result(db, employee)["reply"])
 
     if command == "/leave-admin":
-        query = select(LeaveRequest).where(LeaveRequest.status.in_(["pending_manager", "pending_hr"]))
-        if employee.role not in {"hr", "admin"}:
-            query = query.join(Employee, LeaveRequest.employee_id == Employee.id).where(Employee.manager_id == employee.id)
-        requests = db.scalars(query.order_by(LeaveRequest.id.desc())).all()
-        if not requests:
-            return _ephemeral("There are no pending leave requests for you.")
-        rows = [
-            f"#{item.id} | {item.employee.name} | {item.leave_type} | "
-            f"{item.start_date} to {item.end_date} | {item.status.replace('_', ' ')}"
-            for item in requests
-        ]
-        return _ephemeral("*Pending leave requests*\n" + "\n".join(rows))
+        return _ephemeral(_pending_requests_result(db, employee)["reply"])
 
     if command == "/leave-set-manager":
         manager_match = re.search(r"<@([A-Z0-9]+)", form.get("text", ""))
@@ -500,11 +490,11 @@ def _submit_leave_modal(payload: dict, db: Session) -> dict:
         {
             "channel": employee.slack_user_id,
             "text": (
-                f"Your {leave_policy.get(leave_type).display_name} request #{leave_request.id} was received. "
+                f"*Your {leave_policy.get(leave_type).display_name} request was received.*\n"
                 + (
                     "I am processing the supporting document before notifying your manager."
                     if document_id
-                    else f"It was submitted to {employee.manager.name}."
+                    else f"It was sent to {employee.manager.name} for approval."
                 )
             ),
         },
@@ -616,8 +606,8 @@ def _taken_balances(db: Session, employee: Employee) -> dict[str, float]:
 
 
 def _format_balance_reply(employee: Employee, balances: dict[str, float]) -> str:
-    rows = ", ".join(f"{leave_type}: {days:g} days taken" for leave_type, days in balances.items())
-    return f"{employee.name}'s leave taken this year: {rows}."
+    rows = "\n".join(f"*{leave_name(leave_type)}:* {days:g} days taken" for leave_type, days in balances.items())
+    return f"*Leave taken for {employee.name} in {date.today().year}*\n{rows}"
 
 
 def _balance_result(db: Session, employee: Employee) -> dict:
@@ -648,7 +638,7 @@ def _balance_result_for_query(db: Session, requester: Employee, text: str) -> di
         if not visible:
             return {"type": "balance", "reply": "You do not have any employees whose balance you can view."}
         rows = [_format_balance_reply(person, _taken_balances(db, person)) for person in visible]
-        return {"type": "balance", "reply": "*Employee leave taken this year*\n" + "\n".join(rows)}
+        return {"type": "balance", "reply": "*Employee leave taken this year*\n\n" + "\n\n".join(rows)}
 
     matches = [
         person
@@ -663,12 +653,14 @@ def _balance_result_for_query(db: Session, requester: Employee, text: str) -> di
             "type": "balance",
             "reply": "More than one employee matched that name. Please use the employee's full name.",
         }
-    target_words = ("employee", "report", "staff member", "his balance", "her balance", "their balance")
-    if len(visible) == 1 and any(word in normalized for word in target_words):
-        return _balance_result(db, visible[0])
-    if visible and any(word in normalized for word in target_words):
+    target_words = ("employee", "report", "staff member", "his", "her", "their", "someone")
+    asks_for_self = bool(re.search(r"\b(my|mine)\b", normalized))
+    if visible and (any(word in normalized for word in target_words) or not asks_for_self):
         names = ", ".join(person.name for person in visible)
-        return {"type": "balance", "reply": f"Whose balance do you want to see? You can ask about: {names}."}
+        return {
+            "type": "balance_clarification",
+            "reply": f"*Which employee do you mean?*\nPlease use the employee's name. You can ask about: {names}.",
+        }
     return _balance_result(db, requester)
 
 
@@ -690,11 +682,13 @@ def _pending_requests_result(db: Session, requester: Employee) -> dict:
     if not requests:
         return {"type": "pending_requests", "reply": "There are no pending leave requests for you."}
     rows = [
-        f"#{item.id} | {item.employee.name} | {item.leave_type} | "
-        f"{item.start_date} to {item.end_date} | {item.status.replace('_', ' ')}"
+        f"*{item.employee.name}'s {leave_name(item.leave_type)} request*\n"
+        f"*Dates:* {readable_date(item.start_date)} to {readable_date(item.end_date)}\n"
+        f"*Working days:* {float(item.days_requested):g}\n"
+        f"*Status:* {readable_status(item.status)}"
         for item in requests
     ]
-    return {"type": "pending_requests", "reply": "*Pending leave requests*\n" + "\n".join(rows)}
+    return {"type": "pending_requests", "reply": "*Pending leave requests*\n\n" + "\n\n".join(rows)}
 
 
 def _history_result(db: Session, employee: Employee) -> dict:
@@ -707,11 +701,13 @@ def _history_result(db: Session, employee: Employee) -> dict:
     if not requests:
         return {"type": "history", "reply": "You do not have any leave requests yet."}
     rows = [
-        f"#{item.id} | {item.leave_type} | {item.start_date} to {item.end_date} | "
-        f"{float(item.days_requested):g} day(s) | {item.status.replace('_', ' ')}"
+        f"*{leave_name(item.leave_type)}*\n"
+        f"*Dates:* {readable_date(item.start_date)} to {readable_date(item.end_date)}\n"
+        f"*Working days:* {float(item.days_requested):g}\n"
+        f"*Status:* {readable_status(item.status)}"
         for item in requests
     ]
-    return {"type": "history", "reply": "*Your recent leave requests*\n" + "\n".join(rows)}
+    return {"type": "history", "reply": "*Your recent leave requests*\n\n" + "\n\n".join(rows)}
 
 
 def _status_result(db: Session, employee: Employee) -> dict:
@@ -726,9 +722,11 @@ def _status_result(db: Session, employee: Employee) -> dict:
     return {
         "type": "status",
         "reply": (
-            f"Your latest request is #{request.id}: {request.leave_type}, "
-            f"{request.start_date} to {request.end_date}, "
-            f"status: *{request.status.replace('_', ' ')}*."
+            f"*Your latest leave request*\n"
+            f"*Leave type:* {leave_name(request.leave_type)}\n"
+            f"*Dates:* {readable_date(request.start_date)} to {readable_date(request.end_date)}\n"
+            f"*Working days:* {float(request.days_requested):g}\n"
+            f"*Status:* {readable_status(request.status)}"
         ),
     }
 
@@ -743,11 +741,17 @@ def _handle_chat_approval(text: str, approver: Employee, db: Session) -> dict | 
     if request is None:
         return {"type": "not_found", "reply": "I could not find that leave request."}
     if not can_approve_request(approver, request):
-        return {"type": "permission_denied", "reply": f"{approver.name} is not allowed to approve or reject request #{request.id}."}
+        return {
+            "type": "permission_denied",
+            "reply": f"You are not allowed to decide {request.employee.name}'s leave request.",
+        }
 
     return {
         "type": "approval_queued",
-        "reply": f"I am processing your decision for request #{request.id}.",
+        "reply": (
+            f"I am processing your decision for "
+            f"*{request.employee.name}'s {leave_name(request.leave_type)} request*."
+        ),
         "approved": approved,
         "approver_id": approver.id,
         "stage": "manager" if request.status == "pending_manager" else "hr",

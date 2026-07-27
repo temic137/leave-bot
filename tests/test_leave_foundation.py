@@ -339,6 +339,11 @@ def test_slack_approval_message_contains_buttons(monkeypatch) -> None:
 
     actions = sent["payload"]["blocks"][1]["elements"]
     assert sent["method"] == "chat.postMessage"
+    summary = sent["payload"]["blocks"][0]["text"]["text"]
+    assert "*Leave request from Temi*" in summary
+    assert "*Leave type:* Annual Leave" in summary
+    assert "*Dates:* 15 July 2026 to 16 July 2026" in summary
+    assert "Request #42" not in summary
     assert [(action["action_id"], action["value"]) for action in actions] == [
         ("approve_leave", "42"),
         ("reject_leave", "42"),
@@ -462,11 +467,13 @@ def test_manager_can_ask_for_direct_report_balance(db: Session) -> None:
     result = routes._balance_result_for_query(db, manager, "show Employee's leave balance")
 
     assert result["type"] == "balance"
-    assert "Employee's leave taken this year" in result["reply"]
-    assert "annual: 2 days taken" in result["reply"]
+    assert "Leave taken for Employee" in result["reply"]
+    assert "*Annual Leave:* 2 days taken" in result["reply"]
 
     pronoun_result = routes._balance_result_for_query(db, manager, "show me his balance")
-    assert "Employee's leave taken this year" in pronoun_result["reply"]
+    assert pronoun_result["type"] == "balance_clarification"
+    assert "Which employee do you mean?" in pronoun_result["reply"]
+    assert "Employee" in pronoun_result["reply"]
 
 
 def test_hr_can_view_all_pending_requests(db: Session) -> None:
@@ -485,7 +492,8 @@ def test_hr_can_view_all_pending_requests(db: Session) -> None:
     result = routes._pending_requests_result(db, hr)
 
     assert result["type"] == "pending_requests"
-    assert f"#{request.id} | Employee | annual" in result["reply"]
+    assert "*Employee's Annual Leave request*" in result["reply"]
+    assert "Waiting for manager approval" in result["reply"]
 
 
 def test_hr_views_are_limited_to_their_workspace(db: Session) -> None:
@@ -514,4 +522,4 @@ def test_hr_views_are_limited_to_their_workspace(db: Session) -> None:
     pending = routes._pending_requests_result(db, hr)
 
     assert "Outside Employee" not in balances["reply"]
-    assert f"#{outside_request.id}" not in pending["reply"]
+    assert "Outside Employee" not in pending["reply"]

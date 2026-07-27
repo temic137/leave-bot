@@ -207,16 +207,22 @@ class RealSlackClient(SlackClient):
         end_date: str,
         days: float,
         document_url: str | None = None,
+        reason: str | None = None,
     ) -> None:
+        from app.services.presentation import leave_name, readable_date
+
         summary = (
-            f"*{employee_name}* requested *{leave_type} leave*\n"
-            f"{start_date} to {end_date} | {days:g} day(s) | Request #{request_id}"
+            f"*Leave request from {employee_name}*\n"
+            f"*Leave type:* {leave_name(leave_type)}\n"
+            f"*Dates:* {readable_date(start_date)} to {readable_date(end_date)}\n"
+            f"*Working days:* {days:g}\n"
+            f"*Reason:* {reason or 'No reason provided'}"
         )
         if document_url:
-            summary += f"\n<{document_url}|View supporting document>"
+            summary += f"\n*Document:* <{document_url}|Open supporting document>"
         self._post_message(
             channel=slack_user_id,
-            text=f"{employee_name} submitted leave request #{request_id}.",
+            text=f"{employee_name} submitted a {leave_name(leave_type)} request.",
             blocks=[
                 {"type": "section", "text": {"type": "mrkdwn", "text": summary}},
                 {

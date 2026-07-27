@@ -11,6 +11,7 @@ from app.db.models import DurableJob, Employee, LeaveRequest
 from app.services.jobs import PermanentJobError, enqueue_job
 from app.services.leave_requests import LeaveRequestService
 from app.services.permissions import can_approve_request
+from app.services.presentation import leave_name, readable_date, readable_status
 
 
 logger = logging.getLogger(__name__)
@@ -202,7 +203,10 @@ def _decide_agentspan(db: Session, job: DurableJob, payload: dict) -> None:
             db,
             f"decision-result:{job.id}",
             payload["reply_channel"],
-            f"Request #{request.id} is already {request.status.replace('_', ' ')}.",
+            (
+                f"*{request.employee.name}'s {leave_name(request.leave_type)} request* "
+                f"is already {readable_status(request.status).lower()}."
+            ),
         )
         return
     if not can_approve_request(approver, request):
@@ -210,7 +214,7 @@ def _decide_agentspan(db: Session, job: DurableJob, payload: dict) -> None:
             db,
             f"decision-result:{job.id}",
             payload["reply_channel"],
-            f"You are not allowed to decide request #{request.id}.",
+            f"You are not allowed to decide {request.employee.name}'s leave request.",
         )
         return
     if not request.agentspan_execution_id:
@@ -234,14 +238,17 @@ def _decide_agentspan(db: Session, job: DurableJob, payload: dict) -> None:
         db,
         f"decision-result:{job.id}",
         payload["reply_channel"],
-        f"Request #{request.id} has been {decision_text}.",
+        f"*{request.employee.name}'s {leave_name(request.leave_type)} request* has been {decision_text}.",
     )
     if request.status in {"approved", "rejected"}:
         _queue_message(
             db,
             f"employee-final-decision:{request.id}:{request.status}",
             request.employee.slack_user_id,
-            f"Your leave request #{request.id} has been {request.status}.",
+            (
+                f"*Your {leave_name(request.leave_type)} request has been {request.status}.*\n"
+                f"*Dates:* {readable_date(request.start_date)} to {readable_date(request.end_date)}"
+            ),
         )
     elif request.status == "pending_hr":
         hr_people = db.scalars(
@@ -289,6 +296,7 @@ def _send_approval_card(db: Session, job: DurableJob, payload: dict) -> None:
         str(request.end_date),
         float(request.days_requested),
         request.document_key,
+        request.reason,
     )
 
 
@@ -315,7 +323,7 @@ def _upload_leave_document(db: Session, job: DurableJob, payload: dict) -> None:
             db,
             f"document-rejected:{request.id}",
             request.employee.slack_user_id,
-            f"Leave request #{request.id} was not submitted: {exc}",
+            f"Your {leave_name(request.leave_type)} request was not submitted: {exc}",
         )
         return
 
@@ -331,7 +339,10 @@ def _upload_leave_document(db: Session, job: DurableJob, payload: dict) -> None:
         db,
         f"document-uploaded:{request.id}",
         request.employee.slack_user_id,
-        f"The document for leave request #{request.id} was uploaded. Your manager will now be notified.",
+        (
+            f"Your supporting document was uploaded. "
+            f"Your {leave_name(request.leave_type)} request will now be sent to your manager."
+        ),
     )
 
 
