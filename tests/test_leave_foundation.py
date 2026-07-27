@@ -418,6 +418,33 @@ def test_document_validation_checks_type_signature_and_size(monkeypatch) -> None
         validate_document(b"%PDF-test", "application/pdf")
 
 
+def test_slack_file_info_uses_form_encoding(monkeypatch) -> None:
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return type(
+            "Response",
+            (),
+            {
+                "raise_for_status": lambda self: None,
+                "json": lambda self: {"ok": True, "file": {"id": "F_TEST"}},
+            },
+        )()
+
+    monkeypatch.setattr("app.adapters.slack.httpx.post", fake_post)
+
+    result = RealSlackClient(token="test-token")._api(
+        "files.info",
+        {"file": "F_TEST"},
+        form_encoded=True,
+    )
+
+    assert result["file"]["id"] == "F_TEST"
+    assert calls[0][1]["data"] == {"file": "F_TEST"}
+    assert "json" not in calls[0][1]
+
+
 def test_manager_can_ask_for_direct_report_balance(db: Session) -> None:
     employee, manager, _hr = seed_people(db)
     db.add(

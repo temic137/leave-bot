@@ -278,7 +278,7 @@ class RealSlackClient(SlackClient):
         return directory
 
     def download_file(self, file_id: str) -> tuple[str, str, bytes]:
-        file = self._api("files.info", {"file": file_id}).get("file") or {}
+        file = self._api("files.info", {"file": file_id}, form_encoded=True).get("file") or {}
         size = int(file.get("size") or 0)
         if size > settings.document_max_bytes:
             raise ValueError(
@@ -337,14 +337,15 @@ class RealSlackClient(SlackClient):
             },
         ]
 
-    def _api(self, method: str, payload: dict) -> dict:
+    def _api(self, method: str, payload: dict, *, form_encoded: bool = False) -> dict:
         if not self.token:
             raise RuntimeError("SLACK_BOT_TOKEN is not configured")
+        body = {"data": payload} if form_encoded else {"json": payload}
         response = httpx.post(
             f"https://slack.com/api/{method}",
             headers={"Authorization": f"Bearer {self.token}"},
-            json=payload,
             timeout=10,
+            **body,
         )
         response.raise_for_status()
         data = response.json()
