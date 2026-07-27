@@ -663,7 +663,10 @@ def _balance_result_for_query(db: Session, requester: Employee, text: str) -> di
             "type": "balance",
             "reply": "More than one employee matched that name. Please use the employee's full name.",
         }
-    if visible and any(word in normalized for word in ("employee", "report", "staff member")):
+    target_words = ("employee", "report", "staff member", "his balance", "her balance", "their balance")
+    if len(visible) == 1 and any(word in normalized for word in target_words):
+        return _balance_result(db, visible[0])
+    if visible and any(word in normalized for word in target_words):
         names = ", ".join(person.name for person in visible)
         return {"type": "balance", "reply": f"Whose balance do you want to see? You can ask about: {names}."}
     return _balance_result(db, requester)

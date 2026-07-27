@@ -465,6 +465,9 @@ def test_manager_can_ask_for_direct_report_balance(db: Session) -> None:
     assert "Employee's leave taken this year" in result["reply"]
     assert "annual: 2 days taken" in result["reply"]
 
+    pronoun_result = routes._balance_result_for_query(db, manager, "show me his balance")
+    assert "Employee's leave taken this year" in pronoun_result["reply"]
+
 
 def test_hr_can_view_all_pending_requests(db: Session) -> None:
     employee, _manager, hr = seed_people(db)
