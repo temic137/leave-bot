@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import logging
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -11,14 +12,20 @@ from app.core.logging import configure_logging
 from app.db.models import DurableJob
 from app.db.session import SessionLocal
 from app.services.jobs import DurableJobWorker
+from app.services.intents import get_intent_router
 
 
 configure_logging()
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     worker = DurableJobWorker()
+    try:
+        get_intent_router()
+    except Exception:
+        logger.exception("Intent router failed to load; Slack will show the action menu")
     if settings.job_worker_enabled:
         worker.start()
     app.state.job_worker = worker
@@ -87,7 +94,7 @@ def dependency_status() -> dict:
     return {
         "status": "ok" if not counts.get("dead") else "degraded",
         "jobs": counts,
-        "groq_configured": bool(settings.groq_api_key),
+        "intent_model": settings.intent_model_name,
         "agentspan_configured": bool(settings.agentspan_server_url),
         "slack_configured": bool(settings.slack_bot_token),
     }

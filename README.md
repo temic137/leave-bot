@@ -1,6 +1,6 @@
 # Slack Leave Bot Foundation
 
-This is the foundation for a free-flow Slack leave bot.
+This is the foundation for a structured Slack leave bot.
 
 Current scope:
 
@@ -8,16 +8,18 @@ Current scope:
 - Manager relationships come from an admin CSV.
 - Leave/document rules are placeholders in JSON config.
 - Slack events are acknowledged after they are durably queued in PostgreSQL.
-- Groq interprets messages, AgentSpan owns approval workflow checkpoints, and PostgreSQL owns business data.
+- FastEmbed routes normal employee messages to fixed actions without generating text.
+- Slack commands and modals collect request data, AgentSpan owns approval workflow checkpoints, and PostgreSQL owns business data.
 - Failed Slack and AgentSpan operations are retried with idempotency protection.
 
 ## Architecture
 
 ```text
-Slack -> API -> PostgreSQL durable_jobs -> worker -> Groq parser
-                                                -> business tables
-                                                -> AgentSpan
-                                                -> Slack replies/cards
+Slack DM -> FastEmbed intent -> explained Slack button/menu
+                                      |
+Slack commands/modals -> API -> PostgreSQL durable_jobs -> worker -> AgentSpan
+                                  |                          |
+                                  +-> business tables        +-> Slack replies/cards
 ```
 
 ## Local Setup
@@ -48,18 +50,20 @@ SLACK_SIGNING_SECRET=<Slack signing secret>
 ```
 
 Production requests to `/admin/*` and `/prototype/*` must include the
-`X-Admin-API-Key` header. Slack events remain available at `/slack/events`.
+`X-Admin-API-Key` header. Slack commands use `/slack/commands`, interactions
+use `/slack/interactions`, and events remain available at `/slack/events`.
 
 ## First MVP Flow
 
 1. Seed or sync employees from Slack.
 2. Upload manager mapping CSV.
-3. Employee sends a free-flow leave message.
-4. LLM parser extracts request fields.
-5. API validates policy, balance, permissions, and document requirement.
-6. A durable job starts the approval workflow and notifies the manager.
-7. Manager/HR decisions are processed idempotently through durable jobs.
-8. Approved requests are summed to report days taken.
+3. Employee sends a normal message or runs `/leave-request`.
+4. FastEmbed selects a fixed action; requesting leave produces an explained button.
+5. The button or command opens the Slack modal.
+6. API validates the structured fields, policy, permissions, and document requirement.
+7. A durable job starts the AgentSpan approval workflow and notifies the manager.
+8. Manager/HR decisions are processed idempotently through durable jobs.
+9. Approved requests are summed to report days taken.
 
 ## Slack Scopes To Request
 

@@ -9,12 +9,8 @@ users:read
 users:read.email
 chat:write
 im:write
-im:read
 im:history
-app_mentions:read
 commands
-files:read
-channels:history
 ```
 
 ## Why These Are Needed
@@ -25,22 +21,25 @@ channels:history
 `chat:write`
 : Send bot responses, approval cards, request status updates, and balance messages.
 
-`im:write`, `im:read`, `im:history`
-: Let employees DM the bot naturally and let the bot DM managers/HR.
+`im:write`
+: Let the bot open direct messages with employees, managers, and HR.
+
+`im:history`
+: Receive employee DM events so FastEmbed can route normal messages.
 
 `commands`
-: Optional `/leave` entry point.
+: Register the leave slash commands.
 
-`app_mentions:read`
-: Optional channel mention support.
+## Optional Later
 
 `files:read`
 : Download employee documents from Slack before storing them in S3 or local storage.
 
-`channels:history`
-: Only needed if the bot must read channel messages where it is used. Prefer DM-first for less scope.
+`im:read`, `app_mentions:read`, `channels:history`
+: Only needed for extra DM metadata or channel use. `app_mentions:read` is
+required if employees will mention the bot in channels, and `channels:history`
+is required if the bot reads channel messages.
 
 ## Backend Checks Still Required
 
 Slack authentication proves the event came from Slack. It does not prove the user can approve a request or view a balance. The API must still check the employee table, manager relationship, and HR role.
-

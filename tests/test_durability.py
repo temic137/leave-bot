@@ -1,8 +1,9 @@
-from datetime import date
+from datetime import date, timedelta
 import hashlib
 import hmac
 import json
 import time
+from urllib.parse import urlencode
 
 import httpx
 from fastapi.testclient import TestClient
@@ -68,6 +69,155 @@ def test_slack_event_is_acknowledged_and_deduplicated_before_processing(tmp_path
         job = db.scalar(select(DurableJob))
         assert job.status == "pending"
         assert job.idempotency_key == "slack-event:Ev-duplicate"
+
+
+def test_leave_request_command_opens_structured_modal(tmp_path, monkeypatch) -> None:
+    _engine, factory = make_session_factory(f"sqlite:///{tmp_path / 'commands.db'}")
+
+    def override_db():
+        with factory() as db:
+            yield db
+
+    secret = "test-secret"
+    opened = {}
+    monkeypatch.setattr(routes.settings, "slack_signing_secret", secret)
+    monkeypatch.setattr("app.main.settings.job_worker_enabled", False)
+    monkeypatch.setattr(
+        "app.adapters.slack.RealSlackClient.open_leave_request_modal",
+        lambda self, trigger_id, leave_types: opened.update(
+            {"trigger_id": trigger_id, "leave_types": list(leave_types)}
+        ),
+    )
+    with factory() as db:
+        db.add(Employee(slack_user_id="U_EMPLOYEE", email="employee@example.com", name="Employee"))
+        db.commit()
+
+    body = urlencode(
+        {
+            "command": "/leave-request",
+            "user_id": "U_EMPLOYEE",
+            "trigger_id": "trigger-123",
+        }
+    ).encode()
+    headers = sign_slack(body, secret)
+    headers["content-type"] = "application/x-www-form-urlencoded"
+    app.dependency_overrides[get_db] = override_db
+    try:
+        with TestClient(app) as client:
+            response = client.post("/slack/commands", content=body, headers=headers)
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert opened["trigger_id"] == "trigger-123"
+    assert "annual" in opened["leave_types"]
+
+
+def test_request_leave_button_opens_modal_immediately(tmp_path, monkeypatch) -> None:
+    _engine, factory = make_session_factory(f"sqlite:///{tmp_path / 'button-modal.db'}")
+
+    def override_db():
+        with factory() as db:
+            yield db
+
+    secret = "test-secret"
+    opened = {}
+    monkeypatch.setattr(routes.settings, "slack_signing_secret", secret)
+    monkeypatch.setattr("app.main.settings.job_worker_enabled", False)
+    monkeypatch.setattr(
+        "app.adapters.slack.RealSlackClient.open_leave_request_modal",
+        lambda self, trigger_id, leave_types: opened.update(
+            {"trigger_id": trigger_id, "leave_types": list(leave_types)}
+        ),
+    )
+    with factory() as db:
+        db.add(Employee(slack_user_id="U_EMPLOYEE", email="employee@example.com", name="Employee"))
+        db.commit()
+
+    payload = {
+        "type": "block_actions",
+        "trigger_id": "button-trigger-123",
+        "user": {"id": "U_EMPLOYEE"},
+        "actions": [
+            {
+                "action_id": "open_leave_request_modal",
+                "action_ts": "123.456",
+                "value": "request_leave",
+            }
+        ],
+    }
+    body = urlencode({"payload": json.dumps(payload)}).encode()
+    headers = sign_slack(body, secret)
+    headers["content-type"] = "application/x-www-form-urlencoded"
+    app.dependency_overrides[get_db] = override_db
+    try:
+        with TestClient(app) as client:
+            response = client.post("/slack/interactions", content=body, headers=headers)
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert opened["trigger_id"] == "button-trigger-123"
+    with factory() as db:
+        assert db.scalar(select(func.count()).select_from(DurableJob)) == 0
+
+
+def test_leave_modal_returns_inline_date_validation(tmp_path, monkeypatch) -> None:
+    _engine, factory = make_session_factory(f"sqlite:///{tmp_path / 'modal-errors.db'}")
+
+    def override_db():
+        with factory() as db:
+            yield db
+
+    secret = "test-secret"
+    monkeypatch.setattr(routes.settings, "slack_signing_secret", secret)
+    monkeypatch.setattr("app.main.settings.job_worker_enabled", False)
+    with factory() as db:
+        manager = Employee(slack_user_id="U_MANAGER", email="manager@example.com", name="Manager")
+        employee = Employee(
+            slack_user_id="U_EMPLOYEE",
+            email="employee@example.com",
+            name="Employee",
+            manager=manager,
+        )
+        db.add_all([manager, employee])
+        db.commit()
+
+    start_date = date.today() + timedelta(days=5)
+    payload = {
+        "type": "view_submission",
+        "user": {"id": "U_EMPLOYEE"},
+        "view": {
+            "id": "V_INVALID",
+            "callback_id": "leave_request_submission",
+            "state": {
+                "values": {
+                    "leave_type": {"leave_type_select": {"selected_option": {"value": "annual"}}},
+                    "start_date": {"start_date_select": {"selected_date": start_date.isoformat()}},
+                    "end_date": {
+                        "end_date_select": {"selected_date": (start_date - timedelta(days=1)).isoformat()}
+                    },
+                    "reason": {"reason_input": {"value": ""}},
+                    "document": {"document_input": {"value": ""}},
+                }
+            },
+        },
+    }
+    body = urlencode({"payload": json.dumps(payload)}).encode()
+    headers = sign_slack(body, secret)
+    headers["content-type"] = "application/x-www-form-urlencoded"
+    app.dependency_overrides[get_db] = override_db
+    try:
+        with TestClient(app) as client:
+            response = client.post("/slack/interactions", content=body, headers=headers)
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["response_action"] == "errors"
+    assert "end_date" in response.json()["errors"]
+    with factory() as db:
+        assert db.scalar(select(func.count()).select_from(LeaveRequest)) == 0
 
 
 def test_pending_job_survives_process_restart(tmp_path) -> None:
@@ -157,18 +307,27 @@ def test_agentspan_failure_is_retried_without_losing_request(tmp_path, monkeypat
         assert db.scalar(select(func.count()).select_from(DurableJob).where(DurableJob.job_type == "send_approval_card")) == 1
 
 
-def test_groq_failure_uses_deterministic_parser(monkeypatch) -> None:
-    monkeypatch.setattr(routes.settings, "groq_api_key", "configured-for-test")
-    monkeypatch.setattr(
-        routes.GroqMessageParser,
-        "parse",
-        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.ConnectError("Groq unavailable")),
-    )
-    parsed = routes._parse_leave_message_from_policy("I need annual leave from 2026-07-20 to 2026-07-21")
-    assert parsed.leave_type == "annual"
-    assert parsed.start_date == date(2026, 7, 20)
-    assert parsed.end_date == date(2026, 7, 21)
-    assert not parsed.missing_fields
+def test_dm_request_returns_explained_modal_button(tmp_path, monkeypatch) -> None:
+    _engine, factory = make_session_factory(f"sqlite:///{tmp_path / 'no-llm.db'}")
+
+    class Router:
+        def classify(self, text):
+            return type("Match", (), {"intent": "request_leave"})()
+
+    monkeypatch.setattr(routes, "get_intent_router", lambda: Router())
+    with factory() as db:
+        employee = Employee(slack_user_id="U_EMPLOYEE", email="employee@example.com", name="Employee")
+        db.add(employee)
+        db.commit()
+
+        result = routes._process_chat(
+            routes.ChatIn(slack_user_id="U_EMPLOYEE", text="I need annual leave next week"),
+            db,
+        )
+
+    assert result["type"] == "request_leave_prompt"
+    assert "open a form" in result["reply"]
+    assert "leave type" in result["reply"]
 
 
 def test_database_pool_reconnects_after_dispose(tmp_path) -> None:
@@ -197,7 +356,6 @@ def test_leave_submission_runs_end_to_end_through_queue(tmp_path, monkeypatch) -
     _engine, factory = make_session_factory(f"sqlite:///{tmp_path / 'end-to-end.db'}")
     sent_messages = []
     sent_cards = []
-    monkeypatch.setattr(routes.settings, "groq_api_key", "")
     monkeypatch.setattr(
         "app.services.job_handlers.AgentSpanApprovalWorkflow.start",
         lambda self, leave_request_id, requires_hr: WorkflowHandle("workflow-e2e"),
@@ -215,18 +373,31 @@ def test_leave_submission_runs_end_to_end_through_queue(tmp_path, monkeypatch) -
         manager = Employee(slack_user_id="U_MANAGER", email="manager@example.com", name="Manager", role="manager")
         employee = Employee(slack_user_id="U_EMPLOYEE", email="employee@example.com", name="Employee", manager=manager)
         db.add_all([manager, employee])
-        payload = {
-            "type": "event_callback",
-            "event_id": "Ev-e2e",
-            "event": {
-                "type": "message",
-                "user": "U_EMPLOYEE",
-                "channel": "D_EMPLOYEE",
-                "text": "I need annual leave from 2026-07-20 to 2026-07-21",
+        db.flush()
+        start_date = date.today() + timedelta(days=5)
+        end_date = start_date + timedelta(days=1)
+        submission = {
+            "type": "view_submission",
+            "user": {"id": "U_EMPLOYEE"},
+            "view": {
+                "id": "V_E2E",
+                "callback_id": "leave_request_submission",
+                "state": {
+                    "values": {
+                        "leave_type": {
+                            "leave_type_select": {"selected_option": {"value": "annual"}}
+                        },
+                        "start_date": {"start_date_select": {"selected_date": start_date.isoformat()}},
+                        "end_date": {"end_date_select": {"selected_date": end_date.isoformat()}},
+                        "reason": {"reason_input": {"value": "Family event"}},
+                        "document": {"document_input": {"value": None}},
+                    }
+                },
             },
         }
-        enqueue_job(db, "process_slack_event", "slack-event:Ev-e2e", {"slack_payload": payload})
-        db.commit()
+        result = routes._submit_leave_modal(submission, db)
+        assert result == {"response_action": "clear"}
+        assert routes._submit_leave_modal(submission, db) == {"response_action": "clear"}
 
     worker = DurableJobWorker(factory, retry_base_seconds=0)
     while worker.run_once():
@@ -234,11 +405,11 @@ def test_leave_submission_runs_end_to_end_through_queue(tmp_path, monkeypatch) -
 
     with factory() as db:
         request = db.scalar(select(LeaveRequest))
+        assert db.scalar(select(func.count()).select_from(LeaveRequest)) == 1
         assert request.agentspan_execution_id == "workflow-e2e"
         assert request.status == "pending_manager"
         assert db.scalar(select(func.count()).select_from(DurableJob).where(DurableJob.status != "succeeded")) == 0
-    assert sent_messages[0][0] == "D_EMPLOYEE"
-    assert "has been recorded" in sent_messages[0][1]
+    assert any(channel == "U_EMPLOYEE" and "was submitted" in message for channel, message in sent_messages)
     assert sent_cards[0][0] == "U_MANAGER"
 
 

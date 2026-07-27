@@ -8,19 +8,18 @@ import time
 from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-import httpx
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.adapters.llm import GroqMessageParser
 from app.adapters.slack import RealSlackClient
 from app.core.config import settings
-from app.db.models import ConversationSession, Employee, LeavePolicyVersion, LeaveRequest
+from app.db.models import DurableJob, Employee, LeavePolicyVersion, LeaveRequest
 from app.db.session import get_db
-from app.schemas.leave import BalanceRead, LeaveRequestCreate, LeaveRequestRead, ParsedMessage
+from app.schemas.leave import BalanceRead, LeaveRequestCreate, LeaveRequestRead
 from app.services.balances import BalanceService
 from app.services.employee_sync import EmployeeSyncService
+from app.services.intents import get_intent_router
 from app.services.leave_requests import LeaveRequestService
 from app.services.jobs import enqueue_job
 from app.services.permissions import can_approve_request, can_view_balance
@@ -53,7 +52,6 @@ class PolicyTextIn(BaseModel):
 class ChatIn(BaseModel):
     slack_user_id: str
     text: str
-    document_key: str | None = None
 
 
 class EmployeeIn(BaseModel):
@@ -303,6 +301,71 @@ async def slack_events(
     return {"ok": True}
 
 
+@router.post("/slack/commands")
+async def slack_commands(
+    request: Request,
+    x_slack_signature: str | None = Header(default=None),
+    x_slack_request_timestamp: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> dict:
+    raw_body = await request.body()
+    _verify_slack_signature(raw_body, x_slack_signature, x_slack_request_timestamp)
+    form = {key: values[0] for key, values in parse_qs(raw_body.decode("utf-8")).items()}
+    command = form.get("command", "")
+    user_id = form.get("user_id", "")
+    employee = db.scalar(select(Employee).where(Employee.slack_user_id == user_id))
+    if employee is None:
+        return _ephemeral("Your Slack account is not registered in the leave system.")
+
+    _sync_policy_from_db(db)
+    if command == "/leave-request":
+        trigger_id = form.get("trigger_id")
+        if not trigger_id:
+            return _ephemeral("Slack did not provide a trigger ID. Please run the command again.")
+        RealSlackClient().open_leave_request_modal(trigger_id, leave_policy.all())
+        return {"response_type": "ephemeral", "text": ""}
+
+    if command == "/leave-balance":
+        return _ephemeral(_balance_result(db, employee)["reply"])
+
+    if command == "/leave-history":
+        return _ephemeral(_history_result(db, employee)["reply"])
+
+    if command == "/leave-admin":
+        query = select(LeaveRequest).where(LeaveRequest.status.in_(["pending_manager", "pending_hr"]))
+        if employee.role not in {"hr", "admin"}:
+            query = query.join(Employee, LeaveRequest.employee_id == Employee.id).where(Employee.manager_id == employee.id)
+        requests = db.scalars(query.order_by(LeaveRequest.id.desc())).all()
+        if not requests:
+            return _ephemeral("There are no pending leave requests for you.")
+        rows = [
+            f"#{item.id} | {item.employee.name} | {item.leave_type} | "
+            f"{item.start_date} to {item.end_date} | {item.status.replace('_', ' ')}"
+            for item in requests
+        ]
+        return _ephemeral("*Pending leave requests*\n" + "\n".join(rows))
+
+    if command == "/leave-set-manager":
+        manager_match = re.search(r"<@([A-Z0-9]+)", form.get("text", ""))
+        if not manager_match:
+            return _ephemeral("Use `/leave-set-manager @manager`.")
+        manager = db.scalar(select(Employee).where(Employee.slack_user_id == manager_match.group(1)))
+        if manager is None:
+            return _ephemeral("That manager is not registered in the leave system.")
+        if manager.id == employee.id:
+            return _ephemeral("You cannot assign yourself as your manager.")
+        employee.manager_id = manager.id
+        if manager.role == "employee":
+            manager.role = "manager"
+        db.commit()
+        return _ephemeral(f"{manager.name} is now your manager.")
+
+    return _ephemeral(
+        "Available commands: `/leave-request`, `/leave-balance`, `/leave-history`, "
+        "`/leave-admin`, and `/leave-set-manager @manager`."
+    )
+
+
 @router.post("/slack/interactions")
 async def slack_interactions(
     request: Request,
@@ -314,7 +377,22 @@ async def slack_interactions(
     _verify_slack_signature(raw_body, x_slack_signature, x_slack_request_timestamp)
     form = parse_qs(raw_body.decode("utf-8"))
     payload = json.loads(form.get("payload", ["{}"])[0])
+    if payload.get("type") == "view_submission":
+        return _submit_leave_modal(payload, db)
+
     action = (payload.get("actions") or [{}])[0]
+    if action.get("action_id") == "open_leave_request_modal":
+        user_id = payload.get("user", {}).get("id", "")
+        employee = db.scalar(select(Employee).where(Employee.slack_user_id == user_id))
+        if employee is None:
+            return _ephemeral("Your Slack account is not registered in the leave system.")
+        trigger_id = payload.get("trigger_id")
+        if not trigger_id:
+            return _ephemeral("Slack could not open the form. Please use `/leave-request`.")
+        _sync_policy_from_db(db)
+        RealSlackClient().open_leave_request_modal(trigger_id, leave_policy.all())
+        return {"ok": True}
+
     interaction_id = action.get("action_ts") or payload.get("trigger_id") or hashlib.sha256(raw_body).hexdigest()
     enqueue_job(
         db,
@@ -324,6 +402,106 @@ async def slack_interactions(
     )
     db.commit()
     return {"response_type": "ephemeral", "text": "Processing your decision..."}
+
+
+def _submit_leave_modal(payload: dict, db: Session) -> dict:
+    view = payload.get("view", {})
+    if view.get("callback_id") != "leave_request_submission":
+        return {"response_action": "clear"}
+
+    _sync_policy_from_db(db)
+    user_id = payload.get("user", {}).get("id", "")
+    employee = db.scalar(select(Employee).where(Employee.slack_user_id == user_id))
+    if employee is None:
+        return _modal_errors({"leave_type": "Your Slack account is not registered."})
+    if employee.manager is None:
+        return _modal_errors({"leave_type": "Your manager has not been assigned yet."})
+
+    state = view.get("state", {}).get("values", {})
+    leave_type = _modal_value(state, "leave_type", "leave_type_select", "selected_option", "value")
+    start_text = _modal_value(state, "start_date", "start_date_select", "selected_date")
+    end_text = _modal_value(state, "end_date", "end_date_select", "selected_date")
+    reason = _modal_value(state, "reason", "reason_input", "value")
+    document_key = _modal_value(state, "document", "document_input", "value")
+    errors = {}
+    try:
+        start_date = date.fromisoformat(start_text or "")
+    except ValueError:
+        start_date = None
+        errors["start_date"] = "Choose a valid start date."
+    try:
+        end_date = date.fromisoformat(end_text or "")
+    except ValueError:
+        end_date = None
+        errors["end_date"] = "Choose a valid end date."
+    if start_date and start_date < date.today():
+        errors["start_date"] = "The start date cannot be in the past."
+    if start_date and end_date and end_date < start_date:
+        errors["end_date"] = "The end date cannot be before the start date."
+    if leave_type not in leave_policy.all():
+        errors["leave_type"] = "Choose a valid leave type."
+    elif leave_policy.get(leave_type).requires_document and not document_key:
+        errors["document"] = "This leave policy requires a document reference."
+    if errors:
+        return _modal_errors(errors)
+
+    submission_id = view.get("id") or hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    job_key = f"slack-modal:{submission_id}"
+    if db.scalar(select(DurableJob).where(DurableJob.idempotency_key == job_key)):
+        return {"response_action": "clear"}
+
+    try:
+        leave_request = LeaveRequestService(db).create_request(
+            LeaveRequestCreate(
+                employee_id=employee.id,
+                leave_type=leave_type,
+                start_date=start_date,
+                end_date=end_date,
+                reason=reason or None,
+                document_key=document_key or None,
+            )
+        )
+    except ValueError as exc:
+        return _modal_errors({"leave_type": str(exc)})
+
+    db.flush()
+    enqueue_job(
+        db,
+        "start_agentspan",
+        job_key,
+        {"leave_request_id": leave_request.id},
+    )
+    enqueue_job(
+        db,
+        "send_slack_message",
+        f"leave-confirmation:{submission_id}",
+        {
+            "channel": employee.slack_user_id,
+            "text": (
+                f"Your {leave_policy.get(leave_type).display_name} request #{leave_request.id} "
+                f"for {float(leave_request.days_requested):g} day(s) was submitted to {employee.manager.name}."
+            ),
+        },
+    )
+    db.commit()
+    return {"response_action": "clear"}
+
+
+def _modal_value(state: dict, block_id: str, action_id: str, *path: str):
+    value = state.get(block_id, {}).get(action_id)
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _modal_errors(errors: dict[str, str]) -> dict:
+    return {"response_action": "errors", "errors": errors}
+
+
+def _ephemeral(text: str) -> dict[str, str]:
+    return {"response_type": "ephemeral", "text": text}
 
 
 def _process_chat(payload: ChatIn, db: Session) -> dict:
@@ -340,26 +518,38 @@ def _process_chat(payload: ChatIn, db: Session) -> dict:
     if approval_result is not None:
         return approval_result
 
-    if _is_balance_query(normalized):
-        target = _find_balance_target(db, employee, normalized)
-        if not can_view_balance(employee, target):
-            return {
-                "type": "permission_denied",
-                "reply": f"You are not allowed to view {target.name}'s leave balance.",
-            }
-        balances = _taken_balances(db, target)
+    try:
+        match = get_intent_router().classify(payload.text)
+        logger.info(
+            "Employee message classified",
+            extra={"slack_user_id": employee.slack_user_id, "intent": match.intent},
+        )
+    except Exception:
+        logger.warning("Intent router unavailable; showing employee menu", exc_info=True)
+        match = None
+
+    if match and match.intent == "request_leave":
         return {
-            "type": "balance",
-            "reply": _format_balance_reply(target, balances),
-            "balances": balances,
+            "type": "request_leave_prompt",
+            "reply": (
+                "I can help you submit a leave request. Click *Request leave* below "
+                "to open a form where you can choose the leave type, start and end dates, "
+                "reason, and any required document reference."
+            ),
         }
-
-    if _is_leave_request(normalized) or _get_open_session(db, employee.slack_user_id) is not None:
-        return _handle_leave_request_chat(payload, employee, db)
-
+    if match and match.intent == "check_balance":
+        return _balance_result(db, employee)
+    if match and match.intent == "leave_history":
+        return _history_result(db, employee)
+    if match and match.intent == "check_status":
+        return _status_result(db, employee)
     return {
-        "type": "help",
-        "reply": "I can help you apply for leave or check leave taken. Try: I need annual leave from 2026-07-10 to 2026-07-12, or: show my leave balance.",
+        "type": "employee_menu",
+        "reply": (
+            "Choose an action below. *Request leave* opens the leave form. "
+            "*Check balance* shows your approved days taken. "
+            "*View history* shows your recent leave requests."
+        ),
     }
 
 
@@ -385,23 +575,6 @@ def _strip_bot_mention(text: str) -> str:
     return re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
 
 
-def _is_balance_query(text: str) -> bool:
-    return any(phrase in text for phrase in ("balance", "leave taken", "taken leave", "how many leave", "how many days"))
-
-
-def _is_leave_request(text: str) -> bool:
-    return "leave" in text and any(word in text for word in ("apply", "request", "need", "want", "take", "off"))
-
-
-def _find_balance_target(db: Session, requester: Employee, text: str) -> Employee:
-    if any(phrase in text for phrase in ("my ", "me ", "i ", "mine")):
-        return requester
-    for employee in db.scalars(select(Employee)).all():
-        if employee.name.lower() in text or employee.email.lower() in text:
-            return employee
-    return requester
-
-
 def _taken_balances(db: Session, employee: Employee) -> dict[str, float]:
     balance_service = BalanceService(db)
     target_year = date.today().year
@@ -416,63 +589,48 @@ def _format_balance_reply(employee: Employee, balances: dict[str, float]) -> str
     return f"{employee.name}'s leave taken this year: {rows}."
 
 
-def _handle_leave_request_chat(payload: ChatIn, employee: Employee, db: Session) -> dict:
-    session = _get_open_session(db, employee.slack_user_id)
-    existing_fields = _session_fields(session)
-    parsed = _parse_leave_message_from_policy(payload.text, existing_fields)
-
-    if parsed.missing_fields:
-        _save_session(db, employee.slack_user_id, parsed)
-        db.flush()
-        missing = ", ".join(parsed.missing_fields)
-        return {
-            "type": "missing_fields",
-            "reply": f"I still need: {missing}. You can say it naturally, for example: it starts on the 8th of July and ends on the 24th of July.",
-            "parsed": parsed.model_dump(mode="json"),
-        }
-
-    rule = leave_policy.get(parsed.leave_type or "")
-    if rule.requires_document and not payload.document_key:
-        _save_session(db, employee.slack_user_id, parsed)
-        db.flush()
-        return {
-            "type": "document_required",
-            "reply": f"{rule.display_name} requires a document. Please attach a document before I send it for approval.",
-            "parsed": parsed.model_dump(mode="json"),
-        }
-
-    if employee.manager is None:
-        return {
-            "type": "validation_error",
-            "reply": "Your manager is not assigned yet. Ask an administrator to update your employee record before submitting leave.",
-        }
-
-    try:
-        leave_request = LeaveRequestService(db).create_request(
-            LeaveRequestCreate(
-                employee_id=employee.id,
-                leave_type=parsed.leave_type or "",
-                start_date=parsed.start_date,
-                end_date=parsed.end_date,
-                reason=parsed.reason,
-                document_key=payload.document_key,
-            )
-        )
-    except ValueError as exc:
-        return {"type": "validation_error", "reply": str(exc), "parsed": parsed.model_dump(mode="json")}
-
-    _close_session(session)
-    db.flush()
-
-    manager = employee.manager.name if employee.manager else "your manager"
-    route = f"sent to {manager}"
-    if rule.requires_hr:
-        route += ", and HR will review it after manager approval"
-
+def _balance_result(db: Session, employee: Employee) -> dict:
+    balances = _taken_balances(db, employee)
     return {
-        "type": "leave_submitted",
-        "reply": f"Your {rule.display_name} request for {float(leave_request.days_requested):g} day(s) has been recorded. I am sending it to {manager} now.",
-        "request": LeaveRequestRead.model_validate(leave_request).model_dump(mode="json"),
+        "type": "balance",
+        "reply": _format_balance_reply(employee, balances),
+        "balances": balances,
+    }
+
+
+def _history_result(db: Session, employee: Employee) -> dict:
+    requests = db.scalars(
+        select(LeaveRequest)
+        .where(LeaveRequest.employee_id == employee.id)
+        .order_by(LeaveRequest.id.desc())
+        .limit(10)
+    ).all()
+    if not requests:
+        return {"type": "history", "reply": "You do not have any leave requests yet."}
+    rows = [
+        f"#{item.id} | {item.leave_type} | {item.start_date} to {item.end_date} | "
+        f"{float(item.days_requested):g} day(s) | {item.status.replace('_', ' ')}"
+        for item in requests
+    ]
+    return {"type": "history", "reply": "*Your recent leave requests*\n" + "\n".join(rows)}
+
+
+def _status_result(db: Session, employee: Employee) -> dict:
+    request = db.scalar(
+        select(LeaveRequest)
+        .where(LeaveRequest.employee_id == employee.id)
+        .order_by(LeaveRequest.id.desc())
+        .limit(1)
+    )
+    if request is None:
+        return {"type": "status", "reply": "You do not have a leave request to check yet."}
+    return {
+        "type": "status",
+        "reply": (
+            f"Your latest request is #{request.id}: {request.leave_type}, "
+            f"{request.start_date} to {request.end_date}, "
+            f"status: *{request.status.replace('_', ' ')}*."
+        ),
     }
 
 
@@ -496,97 +654,6 @@ def _handle_chat_approval(text: str, approver: Employee, db: Session) -> dict | 
         "stage": "manager" if request.status == "pending_manager" else "hr",
         "request": LeaveRequestRead.model_validate(request).model_dump(mode="json"),
     }
-
-
-def _get_open_session(db: Session, slack_user_id: str) -> ConversationSession | None:
-    return db.scalar(
-        select(ConversationSession).where(
-            ConversationSession.slack_user_id == slack_user_id,
-            ConversationSession.status == "open",
-        )
-    )
-
-
-def _session_fields(session: ConversationSession | None) -> dict:
-    if session is None or not session.collected_fields_json:
-        return {}
-    try:
-        return json.loads(session.collected_fields_json)
-    except json.JSONDecodeError:
-        return {}
-
-
-def _save_session(db: Session, slack_user_id: str, parsed: ParsedMessage) -> None:
-    session = _get_open_session(db, slack_user_id)
-    if session is None:
-        session = ConversationSession(slack_user_id=slack_user_id, current_intent="create_leave_request")
-        db.add(session)
-
-    fields = _session_fields(session)
-    for key in ("leave_type", "start_date", "end_date", "reason"):
-        value = getattr(parsed, key)
-        if value is not None:
-            fields[key] = value.isoformat() if hasattr(value, "isoformat") else value
-    session.collected_fields_json = json.dumps(fields)
-    session.status = "open"
-
-
-def _close_session(session: ConversationSession | None) -> None:
-    if session is not None:
-        session.status = "closed"
-
-
-def _parse_leave_message_from_policy(text: str, existing_fields: dict | None = None) -> ParsedMessage:
-    existing_fields = existing_fields or {}
-    if settings.groq_api_key:
-        try:
-            parsed = GroqMessageParser().parse(
-                text,
-                leave_types=list(leave_policy.all()),
-                existing_fields=existing_fields,
-            )
-            if parsed.leave_type in leave_policy.all() or parsed.leave_type is None:
-                return parsed
-        except (httpx.HTTPError, KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError):
-            logger.warning("Groq parser unavailable; using deterministic fallback", exc_info=True)
-
-    normalized = text.lower()
-    leave_type = existing_fields.get("leave_type")
-    for key, rule in leave_policy.all().items():
-        candidates = {key.lower(), key.replace("_", " ").lower(), rule.display_name.lower()}
-        tokens = {
-            token
-            for candidate in candidates
-            for token in re.findall(r"[a-z]+", candidate)
-            if token not in {"leave", "days", "day", "maximum"}
-        }
-        if any(candidate in normalized for candidate in candidates) or any(token in normalized for token in tokens):
-            leave_type = key
-            break
-
-    parsed_dates = _parse_dates(text)
-    start_date = parsed_dates[0] if len(parsed_dates) >= 1 else _date_from_existing(existing_fields.get("start_date"))
-    end_date = parsed_dates[1] if len(parsed_dates) >= 2 else _date_from_existing(existing_fields.get("end_date"))
-    if end_date is None and len(parsed_dates) == 1 and start_date is not None:
-        end_date = start_date
-
-    missing = []
-    if leave_type is None:
-        missing.append("leave_type")
-    if start_date is None:
-        missing.append("start_date")
-    if end_date is None:
-        missing.append("end_date")
-
-    return ParsedMessage(
-        intent="create_leave_request",
-        leave_type=leave_type,
-        start_date=start_date,
-        end_date=end_date,
-        reason=existing_fields.get("reason") or text,
-        confidence=0.7 if not missing else 0.35,
-        missing_fields=missing,
-    )
 
 
 def _sync_policy_from_db(db: Session) -> LeavePolicyVersion:
@@ -619,53 +686,6 @@ def _policy_rules_json() -> str:
             for key, rule in leave_policy.all().items()
         }
     )
-
-
-def _date_from_existing(value: str | None) -> date | None:
-    if not value:
-        return None
-    return date.fromisoformat(value)
-
-
-def _parse_dates(text: str) -> list[date]:
-    dates = [date.fromisoformat(value) for value in re.findall(r"\d{4}-\d{2}-\d{2}", text)]
-    if dates:
-        return dates
-
-    months = {
-        "jan": 1,
-        "january": 1,
-        "feb": 2,
-        "february": 2,
-        "mar": 3,
-        "march": 3,
-        "apr": 4,
-        "april": 4,
-        "may": 5,
-        "jun": 6,
-        "june": 6,
-        "jul": 7,
-        "july": 7,
-        "aug": 8,
-        "august": 8,
-        "sep": 9,
-        "sept": 9,
-        "september": 9,
-        "oct": 10,
-        "october": 10,
-        "nov": 11,
-        "november": 11,
-        "dec": 12,
-        "december": 12,
-    }
-    found: list[date] = []
-    pattern = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?(?:\s+of)?\s+([a-zA-Z]+)(?:\s+(\d{4}))?\b")
-    for day_text, month_text, year_text in pattern.findall(text):
-        month = months.get(month_text.lower())
-        if not month:
-            continue
-        found.append(date(int(year_text or date.today().year), month, int(day_text)))
-    return found
 
 
 @router.get("/employees/{employee_id}/balances/{leave_type}", response_model=BalanceRead)

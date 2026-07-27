@@ -12,8 +12,11 @@ class Settings(BaseSettings):
     slack_bot_token: str = ""
     slack_signing_secret: str = ""
 
-    groq_api_key: str = ""
-    groq_model: str = "qwen/qwen3.6-27b"
+    intent_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    intent_examples_path: str = "config/intent_examples.json"
+    intent_confidence_threshold: float = 0.45
+    intent_margin_threshold: float = 0.05
+
     agentspan_server_url: str = ""
 
     job_worker_enabled: bool = True

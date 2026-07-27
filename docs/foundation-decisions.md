@@ -4,10 +4,10 @@
 
 - Employee source: Slack workspace sync.
 - Manager source: admin CSV mapping.
-- Employee interaction: DM-first free-flow messages, optional `/leave`.
+- Employee interaction: FastEmbed intent routing, Slack slash commands, forms, and approval buttons.
 - Leave/document rules: placeholder JSON policy until final company rules exist.
 - Approval workflow: manager first, then HR only when policy requires it.
-- Durable waiting: Agentspan adapter later; local workflow adapter now.
+- Durable waiting: AgentSpan human-approval workflows.
 - Documents/images: storage adapter now; S3 adapter later.
 
 ## Not Final Yet
@@ -18,4 +18,3 @@
 - Whether half-days are allowed.
 - Whether negative balances are allowed per leave type.
 - Production deployment provider.
-

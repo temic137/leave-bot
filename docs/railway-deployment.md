@@ -74,12 +74,14 @@ LEAVE_POLICY_PATH=config/leave_policy.json
 MANAGER_MAPPING_CSV=config/manager_mapping.sample.csv
 SLACK_BOT_TOKEN=xoxb-your-approved-token
 SLACK_SIGNING_SECRET=your-signing-secret
+INTENT_MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2
+INTENT_CONFIDENCE_THRESHOLD=0.45
+INTENT_MARGIN_THRESHOLD=0.05
 ```
 
 Leave these blank for now unless needed:
 
 ```text
-OPENAI_API_KEY=
 AGENTSPAN_API_KEY=
 AWS_ACCESS_KEY_ID=
 AWS_SECRET_ACCESS_KEY=
@@ -125,7 +127,31 @@ Check the durable queue and dependency configuration:
 https://your-service.up.railway.app/health/dependencies
 ```
 
-## 6. Configure Slack Event URL
+## 6. Configure Slack Commands And Interactivity
+
+Create these Slack slash commands:
+
+```text
+/leave-request
+/leave-balance
+/leave-history
+/leave-admin
+/leave-set-manager
+```
+
+Use this request URL for every command:
+
+```text
+https://your-service.up.railway.app/slack/commands
+```
+
+Enable **Interactivity & Shortcuts** and use:
+
+```text
+https://your-service.up.railway.app/slack/interactions
+```
+
+The Event Subscription URL is optional for the structured command flow:
 
 After Slack app approval, go to Slack app dashboard:
 
@@ -139,10 +165,11 @@ Use:
 https://your-service.up.railway.app/slack/events
 ```
 
-Subscribe to bot event:
+To make ordinary DMs return explained action buttons, subscribe to:
 
 ```text
 message.im
+app_home_opened
 ```
 
 Save changes.
@@ -227,7 +254,7 @@ Still incomplete:
 - Slack file upload/document storage, intentionally deferred.
 - Production alert delivery for dead jobs.
 - A protected admin action for manually replaying dead jobs.
-- Live failure testing against the deployed Slack, Groq, AgentSpan, and Supabase services.
+- Live failure testing against the deployed Slack, AgentSpan, and Supabase services.
 
 For pilot testing, this is enough to prove:
 

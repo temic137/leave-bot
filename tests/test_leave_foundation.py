@@ -17,7 +17,9 @@ from app.db.models import Employee, LeavePolicyVersion, LeaveRequestStatus
 from app.db.session import Base
 from app.schemas.leave import LeaveRequestCreate
 from app.services.balances import BalanceService
+from app.services.employee_sync import EmployeeSyncService
 from app.services.leave_requests import LeaveRequestService
+from app.services.intents import IntentRouter
 from app.services.permissions import can_approve_request, can_view_balance
 from app.services.policy import LeavePolicy
 
@@ -54,7 +56,6 @@ def test_database_schema_has_five_business_tables_and_one_job_table() -> None:
         "leave_requests",
         "approval_events",
         "leave_policy_versions",
-        "conversation_sessions",
         "durable_jobs",
     }
 
@@ -66,6 +67,23 @@ def test_manager_can_view_direct_report_balance(db: Session) -> None:
     assert can_view_balance(manager, employee)
     assert can_view_balance(hr, employee)
     assert not can_view_balance(employee, manager)
+
+
+def test_slack_sync_refreshes_placeholder_email_without_losing_manager(db: Session) -> None:
+    employee, manager, _hr = seed_people(db)
+    employee.email = "placeholder@test.invalid"
+    db.flush()
+
+    synced = EmployeeSyncService(db).upsert_slack_user(
+        employee.slack_user_id,
+        "employee@company.example",
+        "Updated Employee",
+    )
+
+    assert synced.id == employee.id
+    assert synced.email == "employee@company.example"
+    assert synced.name == "Updated Employee"
+    assert synced.manager_id == manager.id
 
 
 def test_manager_approval_deducts_balance_for_manager_only_leave(db: Session) -> None:
@@ -303,3 +321,47 @@ def test_slack_approval_message_contains_buttons(monkeypatch) -> None:
         ("approve_leave", "42"),
         ("reject_leave", "42"),
     ]
+
+
+def test_intent_router_uses_confidence_and_margin() -> None:
+    vectors = {
+        "request example": [1.0, 0.0],
+        "balance example": [0.0, 1.0],
+        "request message": [0.98, 0.02],
+        "unclear message": [0.7, 0.7],
+    }
+
+    class FakeEmbedding:
+        def embed(self, texts):
+            return (vectors[text] for text in texts)
+
+    router = IntentRouter(
+        model=FakeEmbedding(),
+        examples={
+            "request_leave": ["request example"],
+            "check_balance": ["balance example"],
+        },
+        threshold=0.5,
+        margin_threshold=0.1,
+    )
+
+    assert router.classify("request message").intent == "request_leave"
+    assert router.classify("unclear message").intent == "unknown"
+
+
+def test_leave_request_button_explains_what_it_opens(monkeypatch) -> None:
+    sent = {}
+    client = RealSlackClient(token="test-token")
+
+    def capture(method: str, payload: dict) -> dict:
+        sent.update({"method": method, "payload": payload})
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_api", capture)
+    explanation = "Click Request leave to open a form for your leave type and dates."
+    client.send_leave_request_prompt("D_EMPLOYEE", explanation)
+
+    assert sent["payload"]["blocks"][0]["text"]["text"] == explanation
+    button = sent["payload"]["blocks"][1]["elements"][0]
+    assert button["action_id"] == "open_leave_request_modal"
+    assert button["text"]["text"] == "Request leave"

@@ -17,6 +17,7 @@ class JsonFormatter(logging.Formatter):
             "attempt",
             "slack_event_id",
             "slack_user_id",
+            "intent",
             "leave_request_id",
             "agentspan_execution_id",
         ):

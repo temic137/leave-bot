@@ -81,17 +81,6 @@ class ApprovalEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
 
-class ConversationSession(Base):
-    __tablename__ = "conversation_sessions"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    slack_user_id: Mapped[str] = mapped_column(String(64), index=True)
-    current_intent: Mapped[str | None] = mapped_column(String(64))
-    collected_fields_json: Mapped[str] = mapped_column(Text, default="{}")
-    status: Mapped[str] = mapped_column(String(32), default="open")
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now)
-
-
 class LeavePolicyVersion(Base):
     __tablename__ = "leave_policy_versions"
 

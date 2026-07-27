@@ -22,6 +22,9 @@ def handle_job(db: Session, job: DurableJob) -> None:
         "start_agentspan": _start_agentspan,
         "decide_agentspan": _decide_agentspan,
         "send_slack_message": _send_slack_message,
+        "send_leave_request_prompt": _send_leave_request_prompt,
+        "send_employee_menu": _send_employee_menu,
+        "publish_employee_home": _publish_employee_home,
         "send_approval_card": _send_approval_card,
     }
     handler = handlers.get(job.job_type)
@@ -36,6 +39,14 @@ def _process_slack_event(db: Session, job: DurableJob, payload: dict) -> None:
     slack_payload = payload["slack_payload"]
     event = slack_payload.get("event", {})
     if event.get("bot_id") or event.get("subtype"):
+        return
+    if event.get("type") == "app_home_opened" and event.get("user"):
+        enqueue_job(
+            db,
+            "publish_employee_home",
+            f"app-home:{event['user']}:{slack_payload.get('event_time', job.id)}",
+            {"slack_user_id": event["user"]},
+        )
         return
     if event.get("type") not in {"message", "app_mention"}:
         return
@@ -58,27 +69,52 @@ def _process_slack_event(db: Session, job: DurableJob, payload: dict) -> None:
 
 
 def _process_slack_interaction(db: Session, job: DurableJob, payload: dict) -> None:
-    from app.api.routes import _handle_chat_approval
+    from app.api.routes import _balance_result, _handle_chat_approval, _history_result
 
     interaction = payload["interaction"]
     user_id = interaction.get("user", {}).get("id")
     action = (interaction.get("actions") or [{}])[0]
     request_id = action.get("value")
     action_id = action.get("action_id")
-    if not user_id or not request_id or action_id not in {"approve_leave", "reject_leave"}:
-        raise PermanentJobError("Invalid Slack approval interaction")
-    approver = db.scalar(select(Employee).where(Employee.slack_user_id == user_id))
-    if approver is None:
-        _queue_message(db, f"interaction-reply:{job.id}", user_id, "Your Slack account is not registered as an approver.")
+    if not user_id:
+        raise PermanentJobError("Slack interaction has no user")
+    employee = db.scalar(select(Employee).where(Employee.slack_user_id == user_id))
+    if employee is None:
+        _queue_message(db, f"interaction-reply:{job.id}", user_id, "Your Slack account is not registered.")
         return
+    if action_id == "check_leave_balance":
+        _queue_chat_result(db, job, user_id, _balance_result(db, employee))
+        return
+    if action_id == "view_leave_history":
+        _queue_chat_result(db, job, user_id, _history_result(db, employee))
+        return
+    if not request_id or action_id not in {"approve_leave", "reject_leave"}:
+        raise PermanentJobError("Invalid Slack interaction")
     verb = "approve" if action_id == "approve_leave" else "reject"
-    result = _handle_chat_approval(f"{verb} request {request_id}", approver, db)
+    result = _handle_chat_approval(f"{verb} request {request_id}", employee, db)
     if result is None:
         result = {"type": "invalid_approval", "reply": "The approval could not be processed."}
     _queue_chat_result(db, job, user_id, result)
 
 
 def _queue_chat_result(db: Session, source_job: DurableJob, reply_channel: str, result: dict) -> None:
+    if result.get("type") == "request_leave_prompt":
+        enqueue_job(
+            db,
+            "send_leave_request_prompt",
+            f"chat-reply:{source_job.id}",
+            {"channel": reply_channel, "text": result["reply"]},
+        )
+        return
+    if result.get("type") == "employee_menu":
+        enqueue_job(
+            db,
+            "send_employee_menu",
+            f"chat-reply:{source_job.id}",
+            {"channel": reply_channel, "text": result["reply"]},
+        )
+        return
+
     _queue_message(db, f"chat-reply:{source_job.id}", reply_channel, result["reply"])
     if result.get("type") == "leave_submitted":
         request_id = result["request"]["id"]
@@ -205,6 +241,18 @@ def _decide_agentspan(db: Session, job: DurableJob, payload: dict) -> None:
 
 def _send_slack_message(db: Session, job: DurableJob, payload: dict) -> None:
     RealSlackClient().send_channel_message(payload["channel"], payload["text"])
+
+
+def _send_leave_request_prompt(db: Session, job: DurableJob, payload: dict) -> None:
+    RealSlackClient().send_leave_request_prompt(payload["channel"], payload["text"])
+
+
+def _send_employee_menu(db: Session, job: DurableJob, payload: dict) -> None:
+    RealSlackClient().send_employee_menu(payload["channel"], payload["text"])
+
+
+def _publish_employee_home(db: Session, job: DurableJob, payload: dict) -> None:
+    RealSlackClient().publish_employee_home(payload["slack_user_id"])
 
 
 def _send_approval_card(db: Session, job: DurableJob, payload: dict) -> None:

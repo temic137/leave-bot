@@ -51,6 +51,118 @@ class RealSlackClient(SlackClient):
     def send_channel_message(self, channel_id: str, text: str) -> None:
         self._post_message(channel=channel_id, text=text)
 
+    def send_leave_request_prompt(self, channel_id: str, text: str) -> None:
+        self._post_message(
+            channel=channel_id,
+            text=text,
+            blocks=[
+                {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Request leave"},
+                            "style": "primary",
+                            "action_id": "open_leave_request_modal",
+                            "value": "request_leave",
+                        }
+                    ],
+                },
+            ],
+        )
+
+    def send_employee_menu(self, channel_id: str, text: str) -> None:
+        self._post_message(channel=channel_id, text=text, blocks=self._employee_action_blocks(text))
+
+    def publish_employee_home(self, slack_user_id: str) -> None:
+        text = (
+            "*Leave bot*\n"
+            "Request leave opens a form for your leave type and dates. "
+            "Check balance shows approved days taken. View history shows your recent requests."
+        )
+        self._api(
+            "views.publish",
+            {
+                "user_id": slack_user_id,
+                "view": {
+                    "type": "home",
+                    "blocks": self._employee_action_blocks(text),
+                },
+            },
+        )
+
+    def open_leave_request_modal(self, trigger_id: str, leave_types: dict) -> None:
+        options = [
+            {
+                "text": {"type": "plain_text", "text": rule.display_name},
+                "value": key,
+            }
+            for key, rule in leave_types.items()
+        ]
+        self._api(
+            "views.open",
+            {
+                "trigger_id": trigger_id,
+                "view": {
+                    "type": "modal",
+                    "callback_id": "leave_request_submission",
+                    "title": {"type": "plain_text", "text": "Request leave"},
+                    "submit": {"type": "plain_text", "text": "Submit"},
+                    "close": {"type": "plain_text", "text": "Cancel"},
+                    "blocks": [
+                        {
+                            "type": "input",
+                            "block_id": "leave_type",
+                            "label": {"type": "plain_text", "text": "Leave type"},
+                            "element": {
+                                "type": "static_select",
+                                "action_id": "leave_type_select",
+                                "options": options,
+                            },
+                        },
+                        {
+                            "type": "input",
+                            "block_id": "start_date",
+                            "label": {"type": "plain_text", "text": "Start date"},
+                            "element": {"type": "datepicker", "action_id": "start_date_select"},
+                        },
+                        {
+                            "type": "input",
+                            "block_id": "end_date",
+                            "label": {"type": "plain_text", "text": "End date"},
+                            "element": {"type": "datepicker", "action_id": "end_date_select"},
+                        },
+                        {
+                            "type": "input",
+                            "block_id": "reason",
+                            "optional": True,
+                            "label": {"type": "plain_text", "text": "Reason"},
+                            "element": {
+                                "type": "plain_text_input",
+                                "action_id": "reason_input",
+                                "multiline": True,
+                            },
+                        },
+                        {
+                            "type": "input",
+                            "block_id": "document",
+                            "optional": True,
+                            "label": {"type": "plain_text", "text": "Document reference"},
+                            "element": {
+                                "type": "plain_text_input",
+                                "action_id": "document_input",
+                                "placeholder": {
+                                    "type": "plain_text",
+                                    "text": "Only required by some leave policies",
+                                },
+                            },
+                        },
+                    ],
+                },
+            },
+        )
+
     def send_approval_card(self, slack_user_id: str, leave_request_id: int, stage: str) -> None:
         self._post_message(
             channel=slack_user_id,
@@ -162,6 +274,36 @@ class RealSlackClient(SlackClient):
         if blocks:
             payload["blocks"] = blocks
         self._api("chat.postMessage", payload)
+
+    @staticmethod
+    def _employee_action_blocks(text: str) -> list[dict]:
+        return [
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Request leave"},
+                        "style": "primary",
+                        "action_id": "open_leave_request_modal",
+                        "value": "request_leave",
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Check balance"},
+                        "action_id": "check_leave_balance",
+                        "value": "check_balance",
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "View history"},
+                        "action_id": "view_leave_history",
+                        "value": "leave_history",
+                    },
+                ],
+            },
+        ]
 
     def _api(self, method: str, payload: dict) -> dict:
         if not self.token:

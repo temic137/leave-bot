@@ -46,7 +46,31 @@ Example tunnel URL:
 https://abc123.ngrok-free.app
 ```
 
-## 4. Slack Event Subscription
+## 4. Slack Commands
+
+In **Slash Commands**, create these commands. Give each one the same request URL:
+
+```text
+/leave-request
+/leave-balance
+/leave-history
+/leave-admin
+/leave-set-manager
+```
+
+For local testing, use:
+
+```text
+https://abc123.ngrok-free.app/slack/commands
+```
+
+In **Interactivity & Shortcuts**, enable interactivity and use:
+
+```text
+https://abc123.ngrok-free.app/slack/interactions
+```
+
+## 5. Optional Event Subscription
 
 In Slack app dashboard:
 
@@ -67,17 +91,20 @@ Subscribe to bot events:
 ```text
 message.im
 app_mention
+app_home_opened
 ```
 
-For the simplest test, use DM with the bot, so `message.im` is the important event.
+Events are optional for the structured command flow. When enabled, an ordinary
+DM is routed to an explained action button, and `app_home_opened` publishes the
+employee action menu in the bot's Home tab.
 
-## 5. Start The Server
+## 6. Start The Server
 
 ```powershell
 .\.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-## 6. Sync Slack Users
+## 7. Sync Slack Users
 
 Once `SLACK_BOT_TOKEN` is set, call:
 
@@ -87,7 +114,7 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/admin/sync/slack"
 
 This imports real Slack users by email and Slack user ID.
 
-## 7. Assign Manager
+## 8. Assign Manager
 
 Open:
 
@@ -162,4 +189,3 @@ This is enough to prove:
 - Employee can request leave by chat.
 - Manager can approve/reject by chat.
 - Leave taken updates after approval.
-

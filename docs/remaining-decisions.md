@@ -4,16 +4,14 @@ This file tracks what still needs to be determined before the foundation becomes
 
 ## 1. Slack App Setup
 
-- Confirm whether employees will use DM only, `/leave` slash command only, or both.
 - Confirm the final Slack OAuth scopes.
-- Decide whether the bot can read channel messages or only direct messages.
 - Decide where Slack approval cards should be sent: manager DM, HR DM, or approval channel.
 - Decide whether Slack file uploads are allowed directly in the bot conversation.
 
 Current assumption:
 
 ```text
-DM-first free-flow messages, optional /leave command, manager/HR approvals by DM.
+Slash commands and Slack forms for employees, with manager/HR approvals by DM.
 ```
 
 ## 2. Employee Sync
@@ -113,20 +111,19 @@ Approved leave updates the request status to `approved`. Days taken are calculat
 The employee view shows accumulated taken days only.
 ```
 
-## 8. LLM Behavior
+## 8. Slack Form Behavior
 
-- Choose the LLM provider.
-- Define the final structured output schema.
-- Decide confidence threshold for accepting parsed messages.
-- Decide when the bot should ask clarification questions.
-- Decide how to handle ambiguous dates like "next Friday".
-- Decide whether the LLM can classify leave type or only extract explicit values.
-- Decide what safety checks should run after parsing.
+- Confirm the final fields shown in the leave request modal.
+- Decide how required documents will be attached.
+- Decide whether a manager rejection requires a comment.
+- Decide whether employees can edit a pending request.
+- Review real employee messages and adjust FastEmbed examples and confidence thresholds.
 
 Current assumption:
 
 ```text
-LLM parses free-flow text only. API enforces all business rules.
+No generative LLM. FastEmbed selects fixed actions, Slack provides structured
+fields, and the API enforces all business rules.
 ```
 
 ## 9. Agentspan Workflow

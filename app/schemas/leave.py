@@ -1,16 +1,6 @@
 from datetime import date
 
-from pydantic import BaseModel, Field
-
-
-class ParsedMessage(BaseModel):
-    intent: str = "unknown"
-    leave_type: str | None = None
-    start_date: date | None = None
-    end_date: date | None = None
-    reason: str | None = None
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    missing_fields: list[str] = Field(default_factory=list)
+from pydantic import BaseModel
 
 
 class LeaveRequestCreate(BaseModel):
