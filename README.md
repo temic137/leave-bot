@@ -11,6 +11,7 @@ Current scope:
 - FastEmbed routes normal employee messages to fixed actions without generating text.
 - Slack commands and modals collect request data, AgentSpan owns approval workflow checkpoints, and PostgreSQL owns business data.
 - Failed Slack and AgentSpan operations are retried with idempotency protection.
+- Supporting documents are uploaded before manager approval begins.
 
 ## Architecture
 
@@ -47,6 +48,9 @@ ADMIN_API_KEY=<random-secret>
 DATABASE_URL=<Supabase transaction pooler URL>
 SLACK_BOT_TOKEN=<Slack bot token>
 SLACK_SIGNING_SECRET=<Slack signing secret>
+AUTOCHEK_UPLOAD_URL=https://api.staging.myautochek.com/document/upload
+AUTOCHEK_API_TOKEN=<Autochek bearer token>
+AUTOCHEK_API_KEY=<Autochek API key>
 ```
 
 Production requests to `/admin/*` and `/prototype/*` must include the
@@ -61,7 +65,7 @@ use `/slack/interactions`, and events remain available at `/slack/events`.
 4. FastEmbed selects a fixed action; requesting leave produces an explained button.
 5. The button or command opens the Slack modal.
 6. API validates the structured fields, policy, permissions, and document requirement.
-7. A durable job starts the AgentSpan approval workflow and notifies the manager.
+7. A durable job uploads any document, then starts AgentSpan and notifies the manager.
 8. Manager/HR decisions are processed idempotently through durable jobs.
 9. Approved requests are summed to report days taken.
 

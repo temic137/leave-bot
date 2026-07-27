@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.adapters.slack import RealSlackClient
+from app.adapters.storage import AutochekDocumentStorage
 from app.adapters.workflow import AgentSpanApprovalWorkflow
 from app.db.models import DurableJob, Employee, LeaveRequest
 from app.services.jobs import PermanentJobError, enqueue_job
@@ -26,6 +27,7 @@ def handle_job(db: Session, job: DurableJob) -> None:
         "send_employee_menu": _send_employee_menu,
         "publish_employee_home": _publish_employee_home,
         "send_approval_card": _send_approval_card,
+        "upload_leave_document": _upload_leave_document,
     }
     handler = handlers.get(job.job_type)
     if handler is None:
@@ -267,6 +269,50 @@ def _send_approval_card(db: Session, job: DurableJob, payload: dict) -> None:
         str(request.start_date),
         str(request.end_date),
         float(request.days_requested),
+        request.document_key,
+    )
+
+
+def _upload_leave_document(db: Session, job: DurableJob, payload: dict) -> None:
+    request = db.scalar(
+        select(LeaveRequest).where(LeaveRequest.id == payload["leave_request_id"]).with_for_update()
+    )
+    if request is None:
+        raise PermanentJobError("Leave request no longer exists")
+    if request.document_key and request.document_key.startswith("https://"):
+        return
+    if not request.document_key or not request.document_key.startswith("slack:"):
+        raise PermanentJobError("Leave request has no Slack document")
+
+    try:
+        filename, content_type, content = RealSlackClient().download_file(
+            request.document_key.removeprefix("slack:")
+        )
+        document_url = AutochekDocumentStorage().store_bytes(filename, content, content_type)
+    except ValueError as exc:
+        request.status = "cancelled"
+        request.document_key = None
+        _queue_message(
+            db,
+            f"document-rejected:{request.id}",
+            request.employee.slack_user_id,
+            f"Leave request #{request.id} was not submitted: {exc}",
+        )
+        return
+
+    request.document_key = document_url
+    request.status = "pending_manager"
+    enqueue_job(
+        db,
+        "start_agentspan",
+        f"agentspan-start:leave-request:{request.id}",
+        {"leave_request_id": request.id},
+    )
+    _queue_message(
+        db,
+        f"document-uploaded:{request.id}",
+        request.employee.slack_user_id,
+        f"The document for leave request #{request.id} was uploaded. Your manager will now be notified.",
     )
 
 

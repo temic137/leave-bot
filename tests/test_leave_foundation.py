@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.api import routes
 from app.main import app
 from app.adapters.slack import RealSlackClient
+from app.adapters.storage import validate_document
 from app.adapters.workflow import AgentSpanApprovalWorkflow
 from app.db.models import Employee, LeavePolicyVersion, LeaveRequest, LeaveRequestStatus
 from app.db.session import Base
@@ -388,15 +389,33 @@ def test_leave_request_button_explains_what_it_opens(monkeypatch) -> None:
     assert button["text"]["text"] == "Request leave"
 
 
-def test_leave_modal_does_not_offer_fake_document_reference(monkeypatch) -> None:
+def test_leave_modal_uses_real_file_input(monkeypatch) -> None:
     sent = {}
     client = RealSlackClient(token="test-token")
     monkeypatch.setattr(client, "_api", lambda method, payload: sent.update(payload) or {"ok": True})
 
     client.open_leave_request_modal("trigger", LeavePolicy().all())
 
-    block_ids = [block.get("block_id") for block in sent["view"]["blocks"]]
-    assert "document" not in block_ids
+    document = next(block for block in sent["view"]["blocks"] if block.get("block_id") == "document")
+    assert document["optional"]
+    assert document["element"] == {
+        "type": "file_input",
+        "action_id": "document_input",
+        "filetypes": ["pdf", "jpg", "jpeg", "png"],
+        "max_files": 1,
+    }
+
+
+def test_document_validation_checks_type_signature_and_size(monkeypatch) -> None:
+    validate_document(b"%PDF-test", "application/pdf")
+
+    with pytest.raises(ValueError, match="reported file type"):
+        validate_document(b"not-a-pdf", "application/pdf")
+    with pytest.raises(ValueError, match="Only PDF"):
+        validate_document(b"GIF89a", "image/gif")
+    monkeypatch.setattr("app.adapters.storage.settings.document_max_bytes", 5)
+    with pytest.raises(ValueError, match="too large"):
+        validate_document(b"%PDF-test", "application/pdf")
 
 
 def test_manager_can_ask_for_direct_report_balance(db: Session) -> None:

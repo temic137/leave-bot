@@ -74,6 +74,10 @@ LEAVE_POLICY_PATH=config/leave_policy.json
 MANAGER_MAPPING_CSV=config/manager_mapping.sample.csv
 SLACK_BOT_TOKEN=xoxb-your-approved-token
 SLACK_SIGNING_SECRET=your-signing-secret
+AUTOCHEK_UPLOAD_URL=https://api.staging.myautochek.com/document/upload
+AUTOCHEK_API_TOKEN=your-autochek-token
+AUTOCHEK_API_KEY=your-autochek-api-key
+DOCUMENT_MAX_BYTES=900000
 INTENT_MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2
 INTENT_CONFIDENCE_THRESHOLD=0.45
 INTENT_MARGIN_THRESHOLD=0.05
@@ -251,7 +255,7 @@ Implemented:
 
 Still incomplete:
 
-- Slack file upload/document storage, intentionally deferred.
+- Private production document storage, retention, deletion, and malware scanning.
 - Production alert delivery for dead jobs.
 - A protected admin action for manually replaying dead jobs.
 - Live failure testing against the deployed Slack, AgentSpan, and Supabase services.

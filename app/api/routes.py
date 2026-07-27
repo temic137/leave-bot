@@ -422,6 +422,7 @@ def _submit_leave_modal(payload: dict, db: Session) -> dict:
     start_text = _modal_value(state, "start_date", "start_date_select", "selected_date")
     end_text = _modal_value(state, "end_date", "end_date_select", "selected_date")
     reason = _modal_value(state, "reason", "reason_input", "value")
+    document_id = _modal_value(state, "document", "document_input", "files", 0, "id")
     errors = {}
     try:
         start_date = date.fromisoformat(start_text or "")
@@ -439,11 +440,8 @@ def _submit_leave_modal(payload: dict, db: Session) -> dict:
         errors["end_date"] = "The end date cannot be before the start date."
     if leave_type not in leave_policy.all():
         errors["leave_type"] = "Choose a valid leave type."
-    elif leave_policy.get(leave_type).requires_document:
-        errors["leave_type"] = (
-            "This leave type requires a file. File upload is not available yet; "
-            "contact HR or choose a leave type that does not require a document."
-        )
+    elif leave_policy.get(leave_type).requires_document and not document_id:
+        errors["document"] = "This leave policy requires a supporting document."
     if errors:
         return _modal_errors(errors)
 
@@ -460,19 +458,28 @@ def _submit_leave_modal(payload: dict, db: Session) -> dict:
                 start_date=start_date,
                 end_date=end_date,
                 reason=reason or None,
-                document_key=None,
+                document_key=f"slack:{document_id}" if document_id else None,
             )
         )
     except ValueError as exc:
         return _modal_errors({"leave_type": str(exc)})
 
     db.flush()
-    enqueue_job(
-        db,
-        "start_agentspan",
-        job_key,
-        {"leave_request_id": leave_request.id},
-    )
+    if document_id:
+        leave_request.status = "draft"
+        enqueue_job(
+            db,
+            "upload_leave_document",
+            job_key,
+            {"leave_request_id": leave_request.id},
+        )
+    else:
+        enqueue_job(
+            db,
+            "start_agentspan",
+            job_key,
+            {"leave_request_id": leave_request.id},
+        )
     enqueue_job(
         db,
         "send_slack_message",
@@ -480,8 +487,12 @@ def _submit_leave_modal(payload: dict, db: Session) -> dict:
         {
             "channel": employee.slack_user_id,
             "text": (
-                f"Your {leave_policy.get(leave_type).display_name} request #{leave_request.id} "
-                f"for {float(leave_request.days_requested):g} day(s) was submitted to {employee.manager.name}."
+                f"Your {leave_policy.get(leave_type).display_name} request #{leave_request.id} was received. "
+                + (
+                    "I am processing the supporting document before notifying your manager."
+                    if document_id
+                    else f"It was submitted to {employee.manager.name}."
+                )
             ),
         },
     )
@@ -492,9 +503,12 @@ def _submit_leave_modal(payload: dict, db: Session) -> dict:
 def _modal_value(state: dict, block_id: str, action_id: str, *path: str):
     value = state.get(block_id, {}).get(action_id)
     for key in path:
-        if not isinstance(value, dict):
+        if isinstance(key, int) and isinstance(value, list) and len(value) > key:
+            value = value[key]
+        elif isinstance(key, str) and isinstance(value, dict):
+            value = value.get(key)
+        else:
             return None
-        value = value.get(key)
     return value
 
 

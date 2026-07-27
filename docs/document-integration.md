@@ -1,74 +1,64 @@
-# Deferred Document Integration
+# Leave Document Integration
 
-Document handling is intentionally deferred. This file preserves the agreed integration design so it can be implemented later without changing the leave-request workflow.
-
-## Proposed Flow
+## Current Demo Flow
 
 ```text
-Employee attaches a PDF or image in Slack
+Employee selects one PDF, JPG, or PNG in the Slack leave form
         |
         v
-Slack sends a file_share event to POST /slack/events
+The API saves the request as draft and queues an upload job
         |
         v
-The API verifies the Slack signature and identifies the employee
+The worker downloads the private Slack file with SLACK_BOT_TOKEN
         |
         v
-The API downloads Slack's private file with SLACK_BOT_TOKEN
+The worker checks the type, file signature, and 900 KB limit
         |
         v
-The API validates file type, size, and filename
-        |
-        v
-The API uploads the file as multipart/form-data to
+The worker uploads multipart field "file" to
 POST https://api.staging.myautochek.com/document/upload
         |
         v
-Autochek returns a hosted fileUrl
+Autochek returns a public Google Cloud Storage URL
         |
         v
-The API stores the fileUrl as the leave request's document reference
+The URL is saved in leave_requests.document_key
         |
         v
-An authorized manager or HR reviewer can open the document while reviewing
-the leave request
+The request moves to pending_manager and the manager is notified
 ```
 
-## Autochek Upload Contract
+If validation fails, the request becomes `cancelled` and the manager is not
+notified. While upload is pending, `document_key` contains `slack:<file-id>`.
+
+## Configuration
 
 ```text
-Method: POST
-URL: https://api.staging.myautochek.com/document/upload
-Content type: multipart/form-data
-File field: file
-Result used by leave bot: file.url
+AUTOCHEK_UPLOAD_URL=https://api.staging.myautochek.com/document/upload
+AUTOCHEK_API_TOKEN=<secret>
+AUTOCHEK_API_KEY=<secret>
+AUTOCHEK_ALT_APP=marketplace_web_app
+DOCUMENT_MAX_BYTES=900000
 ```
 
-The documented bot-tool request containing `file_path` is not the HTTP request sent by the leave bot. The leave bot must download the Slack file and make a real multipart upload.
+The Slack app needs the `files:read` bot scope. Slack accepts files up to 10 MB
+in the modal, but this integration rejects files over 900 KB because the
+Autochek staging gateway has returned HTTP 413 for larger multipart requests.
 
-The loan-specific `Create documents` operation is not required. The leave bot needs hosted file storage, not attachment to an Autochek loan.
+## Security Limit
 
-## Required Changes
+The staging response marks its object as `public: true`. Sending the link only
+to the assigned manager or HR controls who receives it, but does not make the
+underlying object private.
 
-1. Add or confirm the Slack bot scope `files:read`.
-2. Accept Slack `file_share` events and file-only messages.
-3. Download `url_private_download` with the Slack bot token.
-4. Allow only agreed file types, initially PDF, JPEG, and PNG.
-5. Enforce a maximum file size before downloading and uploading.
-6. Add an Autochek-backed implementation of the existing `DocumentStorage` adapter.
-7. Save the returned storage reference on `leave_requests.document_key`.
-8. Add an authorized document link to manager and HR approval messages.
-9. Add malware scanning, retention, deletion, and audit rules before production use.
+Do not use this storage path for production medical or sensitive HR records
+until the organization confirms:
 
-## Decisions Still Required
+- a private production upload endpoint;
+- authenticated downloads or short-lived signed URLs;
+- malware scanning;
+- retention and deletion rules;
+- audit logging and incident ownership.
 
-- The authentication header or service credential required by the Autochek upload endpoint.
-- Whether the staging endpoint may be used for the demonstration.
-- Whether Autochek provides a production upload endpoint suitable for employee records.
-- Whether uploaded URLs are public or private. The sample response contains `public: true`, which is not suitable for sensitive HR documents without explicit approval.
-- The maximum file size and retention period.
-- Whether production access uses private objects and short-lived signed URLs.
-
-## Current Code Status
-
-The policy can mark a leave type as requiring a document, and `leave_requests.document_key` can hold a storage reference. The end-to-end Slack download and remote upload path is not implemented. Until it is implemented, document-required leave should remain disabled for the live demonstration or be tested only with a manually supplied document reference.
+The loan-specific `CreateDocuments` endpoint is not used. Leave documents are
+stored but are not attached to an Autochek loan.

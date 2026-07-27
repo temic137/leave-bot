@@ -144,6 +144,22 @@ class RealSlackClient(SlackClient):
                                 "multiline": True,
                             },
                         },
+                        {
+                            "type": "input",
+                            "block_id": "document",
+                            "optional": True,
+                            "label": {"type": "plain_text", "text": "Supporting document"},
+                            "hint": {
+                                "type": "plain_text",
+                                "text": "Required only when the selected leave policy asks for proof. PDF, JPG, or PNG.",
+                            },
+                            "element": {
+                                "type": "file_input",
+                                "action_id": "document_input",
+                                "filetypes": ["pdf", "jpg", "jpeg", "png"],
+                                "max_files": 1,
+                            },
+                        },
                     ],
                 },
             },
@@ -189,11 +205,14 @@ class RealSlackClient(SlackClient):
         start_date: str,
         end_date: str,
         days: float,
+        document_url: str | None = None,
     ) -> None:
         summary = (
             f"*{employee_name}* requested *{leave_type} leave*\n"
             f"{start_date} to {end_date} | {days:g} day(s) | Request #{request_id}"
         )
+        if document_url:
+            summary += f"\n<{document_url}|View supporting document>"
         self._post_message(
             channel=slack_user_id,
             text=f"{employee_name} submitted leave request #{request_id}.",
@@ -254,6 +273,30 @@ class RealSlackClient(SlackClient):
                 }
             )
         return directory
+
+    def download_file(self, file_id: str) -> tuple[str, str, bytes]:
+        file = self._api("files.info", {"file": file_id}).get("file") or {}
+        size = int(file.get("size") or 0)
+        if size > settings.document_max_bytes:
+            raise ValueError(
+                f"The document is too large. The current upload limit is "
+                f"{settings.document_max_bytes // 1000} KB."
+            )
+        url = file.get("url_private_download") or file.get("url_private")
+        if not url:
+            raise RuntimeError("Slack did not provide a private download URL")
+        response = httpx.get(
+            url,
+            headers={"Authorization": f"Bearer {self.token}"},
+            timeout=60,
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        return (
+            file.get("name") or f"{file_id}.bin",
+            file.get("mimetype") or response.headers.get("content-type", "").split(";")[0],
+            response.content,
+        )
 
     def _post_message(self, channel: str, text: str, blocks: list[dict] | None = None) -> None:
         payload = {"channel": channel, "text": text}

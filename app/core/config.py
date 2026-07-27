@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     leave_policy_path: str = "config/leave_policy.json"
     slack_bot_token: str = ""
     slack_signing_secret: str = ""
+    autochek_upload_url: str = ""
+    autochek_api_token: str = ""
+    autochek_api_key: str = ""
+    autochek_alt_app: str = "marketplace_web_app"
+    document_max_bytes: int = 900_000
 
     intent_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     intent_examples_path: str = "config/intent_examples.json"

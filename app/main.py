@@ -97,6 +97,7 @@ def dependency_status() -> dict:
         "intent_model": settings.intent_model_name,
         "agentspan_configured": bool(settings.agentspan_server_url),
         "slack_configured": bool(settings.slack_bot_token),
+        "document_upload_configured": bool(settings.autochek_upload_url),
     }
 
 

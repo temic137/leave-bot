@@ -413,6 +413,73 @@ def test_leave_submission_runs_end_to_end_through_queue(tmp_path, monkeypatch) -
     assert sent_cards[0][0] == "U_MANAGER"
 
 
+def test_document_leave_uploads_before_manager_is_notified(tmp_path, monkeypatch) -> None:
+    _engine, factory = make_session_factory(f"sqlite:///{tmp_path / 'document-e2e.db'}")
+    sent_messages = []
+    sent_cards = []
+    monkeypatch.setattr(
+        "app.adapters.slack.RealSlackClient.download_file",
+        lambda self, file_id: ("proof.pdf", "application/pdf", b"%PDF-test"),
+    )
+    monkeypatch.setattr(
+        "app.adapters.storage.AutochekDocumentStorage.store_bytes",
+        lambda self, filename, content, content_type: "https://storage.example/proof.pdf",
+    )
+    monkeypatch.setattr(
+        "app.services.job_handlers.AgentSpanApprovalWorkflow.start",
+        lambda self, leave_request_id, requires_hr: WorkflowHandle("workflow-document"),
+    )
+    monkeypatch.setattr("app.services.job_handlers.AgentSpanApprovalWorkflow.ensure_registered", lambda *args: None)
+    monkeypatch.setattr(
+        "app.adapters.slack.RealSlackClient.send_channel_message",
+        lambda self, channel, text: sent_messages.append((channel, text)),
+    )
+    monkeypatch.setattr(
+        "app.adapters.slack.RealSlackClient.send_leave_approval",
+        lambda self, *args: sent_cards.append(args),
+    )
+    with factory() as db:
+        manager = Employee(slack_user_id="U_MANAGER", email="manager@example.com", name="Manager", role="manager")
+        employee = Employee(slack_user_id="U_EMPLOYEE", email="employee@example.com", name="Employee", manager=manager)
+        db.add_all([manager, employee])
+        db.flush()
+        start_date = date.today() + timedelta(days=5)
+        submission = {
+            "type": "view_submission",
+            "user": {"id": "U_EMPLOYEE"},
+            "view": {
+                "id": "V_DOCUMENT",
+                "callback_id": "leave_request_submission",
+                "state": {
+                    "values": {
+                        "leave_type": {"leave_type_select": {"selected_option": {"value": "sick"}}},
+                        "start_date": {"start_date_select": {"selected_date": start_date.isoformat()}},
+                        "end_date": {"end_date_select": {"selected_date": start_date.isoformat()}},
+                        "reason": {"reason_input": {"value": "Medical appointment"}},
+                        "document": {"document_input": {"files": [{"id": "F_DOCUMENT"}]}},
+                    }
+                },
+            },
+        }
+        assert routes._submit_leave_modal(submission, db) == {"response_action": "clear"}
+        request = db.scalar(select(LeaveRequest))
+        assert request.status == "draft"
+        assert request.document_key == "slack:F_DOCUMENT"
+
+    worker = DurableJobWorker(factory, retry_base_seconds=0)
+    while worker.run_once():
+        pass
+
+    with factory() as db:
+        request = db.scalar(select(LeaveRequest))
+        assert request.status == "pending_manager"
+        assert request.document_key == "https://storage.example/proof.pdf"
+        assert request.agentspan_execution_id == "workflow-document"
+    assert any("document" in message.lower() and "uploaded" in message.lower() for _, message in sent_messages)
+    assert sent_cards[0][0] == "U_MANAGER"
+    assert sent_cards[0][-1] == "https://storage.example/proof.pdf"
+
+
 def test_duplicate_approval_jobs_record_one_decision(tmp_path, monkeypatch) -> None:
     _engine, factory = make_session_factory(f"sqlite:///{tmp_path / 'approval.db'}")
     decisions = []
