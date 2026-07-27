@@ -107,8 +107,10 @@ Manager approval first. If policy requires HR, HR approval comes second.
 Current assumption:
 
 ```text
-Approved leave updates the request status to `approved`. Days taken are calculated directly from approved `leave_requests`; there is no separate balance ledger.
-The employee view shows accumulated taken days only.
+Approved leave updates the request status to `approved`. Used days are calculated
+directly from approved `leave_requests`; there is no deduction ledger.
+HR allocation changes are recorded separately in `leave_balance_adjustments`
+with the HR user, amount, year, and reason.
 ```
 
 ## 8. Slack Form Behavior

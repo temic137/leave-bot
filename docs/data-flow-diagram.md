@@ -50,7 +50,7 @@ The API is the main part of the system. It:
 ### Leave Database
 
 PostgreSQL is the bot's main storage. It remembers employees, managers, leave
-requests, policies, and approval decisions.
+requests, policies, approval decisions, and HR balance adjustments.
 
 ### AgentSpan
 
@@ -70,10 +70,11 @@ FastEmbed runs MiniLM inside the API. It can choose actions such as request
 leave, check balance, view history, check status, or help. It does not generate
 answers, read policy rules, extract dates, or approve leave.
 
-### S3 Bucket
+### Document Storage
 
-The S3 bucket will store files such as medical documents. This part is planned
-but is not connected from Slack to S3 yet.
+Slack receives the file. A background job downloads it and sends it to the
+configured organization document service. PostgreSQL stores the returned file
+URL, not the file itself.
 
 ## 2. When An Employee Requests Leave
 
@@ -106,7 +107,7 @@ but is not connected from Slack to S3 yet.
                             8. AgentSpan starts the approval process.
                                   |
                                   v
-                            9. The manager receives Approve and Reject buttons.
+9. The manager receives Approve and Reject buttons.
 ```
 
 No generative LLM is used. Slack gives the API structured values, so the API
@@ -116,7 +117,21 @@ If the employee starts with a normal message, FastEmbed chooses an action. The
 bot explains what the matching button will do before showing it. If the match is
 unclear, the bot explains and shows all available action buttons.
 
-## 3. When A Manager Approves
+## 3. Cancelling Leave
+
+```text
+Pending request:
+Employee chooses Cancel -> request is cancelled immediately
+
+Approved request:
+Employee requests cancellation -> manager receives a cancellation card
+                                  -> manager approves or keeps the leave
+```
+
+The old approval card is updated to show the latest status. Its buttons are
+removed so the same decision cannot be clicked again.
+
+## 4. When A Manager Approves
 
 ```text
 1. The manager clicks Approve in Slack.
@@ -239,14 +254,21 @@ leave_requests
   - Start and end dates
   - Number of days
   - Current status
+  - Slack messages that need to be updated
        |
        | one request can have many decisions
        v
 approval_events
-  - Who approved or rejected
+  - Who approved, rejected, cancelled, or overrode
   - Their role
   - Their decision
   - When it happened
+
+leave_balance_adjustments
+  - Employee and leave type
+  - Year
+  - Days added or removed by HR
+  - Reason and HR user
 
 
 leave_policy_versions
@@ -272,6 +294,12 @@ approval_events.leave_request_id
 
 approval_events.approver_id
     points to the manager or HR person who made the decision
+
+leave_balance_adjustments.employee_id
+    points to the employee whose allocation changed
+
+leave_balance_adjustments.adjusted_by_id
+    points to the HR or admin user who made the change
 ```
 
 ## 9. What Each Table Is For
@@ -281,6 +309,7 @@ approval_events.approver_id
 | `employees` | People, Slack IDs, roles, and manager links. |
 | `leave_requests` | Every leave request and its current result. |
 | `approval_events` | A history of who approved or rejected each request. |
+| `leave_balance_adjustments` | Audited days added to or removed from an employee's allocation. |
 | `leave_policy_versions` | The current policy and all older versions. |
 | `durable_jobs` | Work that must survive a restart and may need to be tried again. |
 

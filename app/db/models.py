@@ -22,6 +22,7 @@ class LeaveRequestStatus(StrEnum):
     draft = "draft"
     pending_manager = "pending_manager"
     pending_hr = "pending_hr"
+    pending_cancellation_manager = "pending_cancellation_manager"
     approved = "approved"
     rejected = "rejected"
     cancelled = "cancelled"
@@ -64,6 +65,8 @@ class LeaveRequest(Base):
     document_key: Mapped[str | None] = mapped_column(String(512))
     status: Mapped[str] = mapped_column(String(32), default=LeaveRequestStatus.pending_manager.value)
     agentspan_execution_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    cancellation_agentspan_execution_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    slack_message_refs: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime)
 
@@ -79,6 +82,19 @@ class ApprovalEvent(Base):
     approver_role: Mapped[str] = mapped_column(String(32))
     decision: Mapped[str] = mapped_column(String(32), default=ApprovalDecision.pending.value)
     comment: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+
+
+class LeaveBalanceAdjustment(Base):
+    __tablename__ = "leave_balance_adjustments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), index=True)
+    adjusted_by_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), index=True)
+    leave_type: Mapped[str] = mapped_column(String(64), index=True)
+    year: Mapped[int] = mapped_column(Integer, index=True)
+    days_delta: Mapped[float] = mapped_column(Numeric(6, 2))
+    reason: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
 
 

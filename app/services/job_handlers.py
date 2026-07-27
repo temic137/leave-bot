@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.adapters.slack import RealSlackClient
 from app.adapters.storage import AutochekDocumentStorage
 from app.adapters.workflow import AgentSpanApprovalWorkflow
-from app.db.models import DurableJob, Employee, LeaveRequest
+from app.db.models import DurableJob, Employee, LeaveRequest, LeaveRequestStatus
 from app.services.jobs import PermanentJobError, enqueue_job
 from app.services.leave_requests import LeaveRequestService
 from app.services.permissions import can_approve_request
@@ -29,11 +29,18 @@ def handle_job(db: Session, job: DurableJob) -> None:
         "send_slack_message": _send_slack_message,
         "send_leave_request_prompt": _send_leave_request_prompt,
         "send_employee_menu": _send_employee_menu,
+        "send_leave_history": _send_leave_history,
         "send_balance_report_menu": _send_balance_report_menu,
         "send_balance_report_page": _send_balance_report_page,
         "send_balance_report_csv": _send_balance_report_csv,
         "publish_employee_home": _publish_employee_home,
         "send_approval_card": _send_approval_card,
+        "send_cancellation_card": _send_cancellation_card,
+        "update_leave_cards": _update_leave_cards,
+        "cancel_leave_request": _cancel_leave_request,
+        "decide_leave_cancellation": _decide_leave_cancellation,
+        "adjust_leave_balance": _adjust_leave_balance,
+        "override_leave_request": _override_leave_request,
         "upload_leave_document": _upload_leave_document,
     }
     handler = handlers.get(job.job_type)
@@ -88,6 +95,7 @@ def _process_slack_interaction(db: Session, job: DurableJob, payload: dict) -> N
     from app.api.routes import (
         _balance_report_page_result,
         _balance_result,
+        _handle_cancellation,
         _handle_chat_approval,
         _history_result,
     )
@@ -114,6 +122,45 @@ def _process_slack_interaction(db: Session, job: DurableJob, payload: dict) -> N
         return
     if action_id == "view_leave_history":
         _queue_chat_result(db, job, user_id, _history_result(db, employee))
+        return
+    if action_id == "cancel_leave":
+        try:
+            leave_request_id = int(request_id)
+        except (TypeError, ValueError) as exc:
+            raise PermanentJobError("Invalid cancellation request") from exc
+        _queue_chat_result(
+            db,
+            job,
+            user_id,
+            _handle_cancellation(employee, leave_request_id, db),
+        )
+        return
+    if action_id in {
+        "approve_leave_cancellation",
+        "reject_leave_cancellation",
+    }:
+        try:
+            leave_request_id = int(request_id)
+        except (TypeError, ValueError) as exc:
+            raise PermanentJobError("Invalid cancellation decision") from exc
+        enqueue_job(
+            db,
+            "decide_leave_cancellation",
+            f"cancellation-decision:{job.id}",
+            {
+                "leave_request_id": leave_request_id,
+                "approver_id": employee.id,
+                "approved": action_id == "approve_leave_cancellation",
+                "reply_channel": user_id,
+                "message_ref": _interaction_message_ref(interaction),
+            },
+        )
+        _queue_message(
+            db,
+            f"cancellation-decision-started:{job.id}",
+            user_id,
+            "I am processing your cancellation decision.",
+        )
         return
     if action_id in {"balance_report_page", "download_balance_report"} and employee.role not in {
         "manager",
@@ -160,6 +207,8 @@ def _process_slack_interaction(db: Session, job: DurableJob, payload: dict) -> N
     result = _handle_chat_approval(f"{verb} request {request_id}", employee, db)
     if result is None:
         result = {"type": "invalid_approval", "reply": "The approval could not be processed."}
+    else:
+        result["message_ref"] = _interaction_message_ref(interaction)
     _queue_chat_result(db, job, user_id, result)
 
 
@@ -180,12 +229,28 @@ def _queue_chat_result(db: Session, source_job: DurableJob, reply_channel: str, 
             {"channel": reply_channel, "text": result["reply"]},
         )
         return
+    if result.get("type") == "history":
+        enqueue_job(
+            db,
+            "send_leave_history",
+            f"chat-reply:{source_job.id}",
+            {
+                "channel": reply_channel,
+                "text": result["reply"],
+                "cancellable_requests": result.get("cancellable_requests", []),
+            },
+        )
+        return
     if result.get("type") == "balance_report_menu":
         enqueue_job(
             db,
             "send_balance_report_menu",
             f"chat-reply:{source_job.id}",
-            {"channel": reply_channel, "text": result["reply"]},
+            {
+                "channel": reply_channel,
+                "text": result["reply"],
+                "can_manage": result.get("can_manage", False),
+            },
         )
         return
     if result.get("type") == "balance_report_page":
@@ -225,8 +290,26 @@ def _queue_chat_result(db: Session, source_job: DurableJob, reply_channel: str, 
                 "approved": result["approved"],
                 "stage": result["stage"],
                 "reply_channel": reply_channel,
+                "message_ref": result.get("message_ref"),
             },
         )
+    elif result.get("type") == "cancellation_queued":
+        enqueue_job(
+            db,
+            "cancel_leave_request",
+            f"leave-cancellation:{source_job.id}",
+            {
+                "leave_request_id": result["request"]["id"],
+                "employee_id": result["request"]["employee_id"],
+                "reply_channel": reply_channel,
+            },
+        )
+
+
+def _interaction_message_ref(interaction: dict) -> dict | None:
+    channel = interaction.get("channel", {}).get("id")
+    timestamp = interaction.get("message", {}).get("ts")
+    return {"channel": channel, "ts": timestamp} if channel and timestamp else None
 
 
 def _start_agentspan(db: Session, job: DurableJob, payload: dict) -> None:
@@ -272,6 +355,13 @@ def _decide_agentspan(db: Session, job: DurableJob, payload: dict) -> None:
 
     expected_status = "pending_manager" if payload["stage"] == "manager" else "pending_hr"
     if request.status != expected_status:
+        _queue_leave_card_update(
+            db,
+            f"approval-card-stale:{job.id}",
+            request,
+            payload.get("message_ref"),
+            ["approval:", "clicked"],
+        )
         _queue_message(
             db,
             f"decision-result:{job.id}",
@@ -305,6 +395,13 @@ def _decide_agentspan(db: Session, job: DurableJob, payload: dict) -> None:
     else:
         service.record_hr_decision(approver, request, payload["approved"], "Slack decision")
     db.flush()
+    _queue_leave_card_update(
+        db,
+        f"approval-card-update:{job.id}",
+        request,
+        payload.get("message_ref"),
+        ["approval:", "clicked"],
+    )
 
     decision_text = "approved" if payload["approved"] else "rejected"
     _queue_message(
@@ -352,8 +449,20 @@ def _send_employee_menu(db: Session, job: DurableJob, payload: dict) -> None:
     RealSlackClient().send_employee_menu(payload["channel"], payload["text"])
 
 
+def _send_leave_history(db: Session, job: DurableJob, payload: dict) -> None:
+    RealSlackClient().send_leave_history(
+        payload["channel"],
+        payload["text"],
+        payload.get("cancellable_requests", []),
+    )
+
+
 def _send_balance_report_menu(db: Session, job: DurableJob, payload: dict) -> None:
-    RealSlackClient().send_balance_report_menu(payload["channel"], payload["text"])
+    RealSlackClient().send_balance_report_menu(
+        payload["channel"],
+        payload["text"],
+        payload.get("can_manage", False),
+    )
 
 
 def _send_balance_report_page(db: Session, job: DurableJob, payload: dict) -> None:
@@ -397,7 +506,12 @@ def _send_balance_report_csv(db: Session, job: DurableJob, payload: dict) -> Non
     _sync_policy_from_db(db)
     employees = db.scalars(_visible_employee_query(requester).order_by(Employee.name)).all()
     year = date.today().year
-    grouped = BalanceService(db).get_taken_days_for_employees(
+    balance_service = BalanceService(db)
+    grouped = balance_service.get_taken_days_for_employees(
+        [employee.id for employee in employees],
+        year,
+    )
+    allocations = balance_service.get_allocated_days_for_employees(
         [employee.id for employee in employees],
         year,
     )
@@ -409,15 +523,16 @@ def _send_balance_report_csv(db: Session, job: DurableJob, payload: dict) -> Non
     for employee in employees:
         for leave_type, rule in leave_policy.all().items():
             used = grouped.get(employee.id, {}).get(leave_type, 0.0)
+            allocated = allocations[employee.id][leave_type]
             writer.writerow(
                 [
                     employee.name,
                     employee.email,
                     employee.department or "",
                     rule.display_name,
-                    rule.annual_days,
+                    allocated,
                     used,
-                    rule.annual_days - used,
+                    allocated - used,
                     year,
                 ]
             )
@@ -444,10 +559,14 @@ def _publish_employee_home(db: Session, job: DurableJob, payload: dict) -> None:
 
 
 def _send_approval_card(db: Session, job: DurableJob, payload: dict) -> None:
-    request = db.get(LeaveRequest, payload["leave_request_id"])
+    request = db.scalar(
+        select(LeaveRequest)
+        .where(LeaveRequest.id == payload["leave_request_id"])
+        .with_for_update()
+    )
     if request is None:
         raise PermanentJobError("Leave request no longer exists")
-    RealSlackClient().send_leave_approval(
+    response = RealSlackClient().send_leave_approval(
         payload["recipient_slack_user_id"],
         request.id,
         request.employee.name,
@@ -457,6 +576,349 @@ def _send_approval_card(db: Session, job: DurableJob, payload: dict) -> None:
         float(request.days_requested),
         request.document_key,
         request.reason,
+    )
+    _store_message_ref(
+        request,
+        f"approval:{payload['recipient_slack_user_id']}",
+        response,
+    )
+
+
+def _send_cancellation_card(db: Session, job: DurableJob, payload: dict) -> None:
+    request = db.scalar(
+        select(LeaveRequest)
+        .where(LeaveRequest.id == payload["leave_request_id"])
+        .with_for_update()
+    )
+    if request is None:
+        raise PermanentJobError("Leave request no longer exists")
+    response = RealSlackClient().send_cancellation_approval(
+        request.employee.manager.slack_user_id,
+        request.id,
+        request.employee.name,
+        request.leave_type,
+        str(request.start_date),
+        str(request.end_date),
+        float(request.days_requested),
+    )
+    _store_message_ref(
+        request,
+        f"cancellation:{request.employee.manager.slack_user_id}",
+        response,
+    )
+
+
+def _update_leave_cards(db: Session, job: DurableJob, payload: dict) -> None:
+    request = db.get(LeaveRequest, payload["leave_request_id"])
+    if request is None:
+        raise PermanentJobError("Leave request no longer exists")
+    refs = _message_refs(request)
+    extra_ref = payload.get("extra_ref")
+    if extra_ref:
+        refs["clicked"] = extra_ref
+    prefixes = payload.get("prefixes") or ["approval:", "cancellation:", "clicked"]
+    unique_refs = {
+        (ref["channel"], ref["ts"])
+        for key, ref in refs.items()
+        if any(key.startswith(prefix) for prefix in prefixes)
+        and ref.get("channel")
+        and ref.get("ts")
+    }
+    slack = RealSlackClient()
+    for channel, timestamp in unique_refs:
+        slack.update_leave_card(
+            channel,
+            timestamp,
+            request.employee.name,
+            request.leave_type,
+            str(request.start_date),
+            str(request.end_date),
+            float(request.days_requested),
+            request.document_key,
+            request.reason,
+            request.status,
+        )
+
+
+def _message_refs(request: LeaveRequest) -> dict:
+    try:
+        return json.loads(request.slack_message_refs or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
+def _store_message_ref(request: LeaveRequest, key: str, response: dict | None) -> None:
+    if not response or not response.get("channel") or not response.get("ts"):
+        return
+    refs = _message_refs(request)
+    refs[key] = {"channel": response["channel"], "ts": response["ts"]}
+    request.slack_message_refs = json.dumps(refs)
+
+
+def _queue_leave_card_update(
+    db: Session,
+    key: str,
+    request: LeaveRequest,
+    extra_ref: dict | None = None,
+    prefixes: list[str] | None = None,
+) -> None:
+    enqueue_job(
+        db,
+        "update_leave_cards",
+        key,
+        {
+            "leave_request_id": request.id,
+            "extra_ref": extra_ref,
+            "prefixes": prefixes,
+        },
+    )
+
+
+def _cancel_leave_request(db: Session, job: DurableJob, payload: dict) -> None:
+    request = db.scalar(
+        select(LeaveRequest)
+        .where(LeaveRequest.id == payload["leave_request_id"])
+        .with_for_update()
+    )
+    employee = db.get(Employee, payload["employee_id"])
+    if request is None or employee is None:
+        raise PermanentJobError("Employee or leave request no longer exists")
+    if request.status not in {
+        LeaveRequestStatus.draft.value,
+        LeaveRequestStatus.pending_manager.value,
+        LeaveRequestStatus.pending_hr.value,
+        LeaveRequestStatus.approved.value,
+    }:
+        _queue_message(
+            db,
+            f"cancellation-result:{job.id}",
+            payload["reply_channel"],
+            (
+                f"Your {leave_name(request.leave_type)} request is already "
+                f"{readable_status(request.status).lower()}."
+            ),
+        )
+        return
+    original_status = request.status
+    if original_status in {"draft", "pending_manager", "pending_hr"} and request.agentspan_execution_id:
+        AgentSpanApprovalWorkflow().cancel(
+            request.agentspan_execution_id,
+            "Cancelled by employee",
+        )
+    needs_manager = LeaveRequestService(db).request_cancellation(employee, request)
+    db.flush()
+    if needs_manager:
+        if request.employee.manager is None:
+            raise PermanentJobError("Employee has no manager for cancellation approval")
+        workflow = AgentSpanApprovalWorkflow()
+        workflow.ensure_cancellation_registered()
+        handle = workflow.start_cancellation(request.id, job.id)
+        request.cancellation_agentspan_execution_id = handle.execution_id
+        enqueue_job(
+            db,
+            "send_cancellation_card",
+            f"cancellation-card:{request.id}:{job.id}",
+            {"leave_request_id": request.id},
+        )
+        _queue_leave_card_update(
+            db,
+            f"approval-card-cancellation-pending:{request.id}:{job.id}",
+            request,
+            prefixes=["approval:"],
+        )
+        message = (
+            f"Your manager has been asked to approve cancellation of your "
+            f"{leave_name(request.leave_type)} request."
+        )
+    else:
+        _queue_leave_card_update(
+            db,
+            f"approval-card-cancelled:{request.id}",
+            request,
+            prefixes=["approval:"],
+        )
+        message = f"Your {leave_name(request.leave_type)} request has been cancelled."
+    _queue_message(
+        db,
+        f"cancellation-result:{job.id}",
+        payload["reply_channel"],
+        message,
+    )
+
+
+def _decide_leave_cancellation(db: Session, job: DurableJob, payload: dict) -> None:
+    request = db.scalar(
+        select(LeaveRequest)
+        .where(LeaveRequest.id == payload["leave_request_id"])
+        .with_for_update()
+    )
+    approver = db.get(Employee, payload["approver_id"])
+    if request is None or approver is None:
+        raise PermanentJobError("Approver or leave request no longer exists")
+    if request.status != LeaveRequestStatus.pending_cancellation_manager.value:
+        _queue_leave_card_update(
+            db,
+            f"cancellation-card-stale:{job.id}",
+            request,
+            payload.get("message_ref"),
+        )
+        _queue_message(
+            db,
+            f"cancellation-manager-result:{job.id}",
+            payload["reply_channel"],
+            (
+                f"*{request.employee.name}'s {leave_name(request.leave_type)} request* "
+                f"is already {readable_status(request.status).lower()}."
+            ),
+        )
+        return
+    if not request.cancellation_agentspan_execution_id:
+        raise PermanentJobError("Cancellation workflow has not started")
+    AgentSpanApprovalWorkflow().decide_cancellation(
+        request.cancellation_agentspan_execution_id,
+        payload["approved"],
+    )
+    LeaveRequestService(db).record_cancellation_decision(
+        approver,
+        request,
+        payload["approved"],
+    )
+    db.flush()
+    _queue_leave_card_update(
+        db,
+        f"cancellation-card-update:{job.id}",
+        request,
+        payload.get("message_ref"),
+    )
+    outcome = "cancelled" if payload["approved"] else "kept approved"
+    _queue_message(
+        db,
+        f"cancellation-manager-result:{job.id}",
+        payload["reply_channel"],
+        f"*{request.employee.name}'s {leave_name(request.leave_type)} request* has been {outcome}.",
+    )
+    _queue_message(
+        db,
+        f"cancellation-employee-result:{job.id}",
+        request.employee.slack_user_id,
+        f"Your {leave_name(request.leave_type)} request has been {outcome}.",
+    )
+
+
+def _adjust_leave_balance(db: Session, job: DurableJob, payload: dict) -> None:
+    from app.api.routes import _sync_policy_from_db
+    from app.services.balances import BalanceService
+
+    _sync_policy_from_db(db)
+    adjuster = db.get(Employee, payload["adjuster_id"])
+    employee = db.get(Employee, payload["employee_id"])
+    if adjuster is None or employee is None:
+        raise PermanentJobError("Adjuster or employee no longer exists")
+    service = BalanceService(db)
+    try:
+        service.adjust_allocation(
+            adjuster,
+            employee,
+            payload["leave_type"],
+            int(payload["year"]),
+            float(payload["days_delta"]),
+            payload["reason"],
+        )
+    except ValueError as exc:
+        _queue_message(
+            db,
+            f"balance-adjustment-error:{job.id}",
+            payload["reply_channel"],
+            str(exc),
+        )
+        return
+    allocated = service.get_allocated_days(
+        employee.id,
+        payload["leave_type"],
+        int(payload["year"]),
+    )
+    used = service.get_taken_days(
+        employee.id,
+        payload["leave_type"],
+        int(payload["year"]),
+    )
+    _queue_message(
+        db,
+        f"balance-adjustment-result:{job.id}",
+        payload["reply_channel"],
+        (
+            f"*{employee.name}'s {leave_name(payload['leave_type'])} balance was adjusted.*\n"
+            f"*Allocated:* {allocated:g} days\n"
+            f"*Used:* {used:g} days\n"
+            f"*Remaining:* {allocated - used:g} days"
+        ),
+    )
+
+
+def _override_leave_request(db: Session, job: DurableJob, payload: dict) -> None:
+    request = db.scalar(
+        select(LeaveRequest)
+        .where(LeaveRequest.id == payload["leave_request_id"])
+        .with_for_update()
+    )
+    approver = db.get(Employee, payload["approver_id"])
+    if request is None or approver is None:
+        raise PermanentJobError("Approver or leave request no longer exists")
+    original_status = request.status
+    try:
+        LeaveRequestService(db).override_request(
+            approver,
+            request,
+            payload["status"],
+            payload["reason"],
+        )
+    except ValueError as exc:
+        _queue_message(
+            db,
+            f"request-override-error:{job.id}",
+            payload["reply_channel"],
+            str(exc),
+        )
+        return
+    if request.agentspan_execution_id and original_status in {
+        "pending_manager",
+        "pending_hr",
+    }:
+        AgentSpanApprovalWorkflow().cancel(
+            request.agentspan_execution_id,
+            f"HR override: {payload['reason']}",
+        )
+    if (
+        request.cancellation_agentspan_execution_id
+        and original_status == LeaveRequestStatus.pending_cancellation_manager.value
+    ):
+        AgentSpanApprovalWorkflow().cancel(
+            request.cancellation_agentspan_execution_id,
+            f"HR override: {payload['reason']}",
+        )
+    db.flush()
+    _queue_leave_card_update(
+        db,
+        f"override-card-update:{job.id}",
+        request,
+    )
+    _queue_message(
+        db,
+        f"override-result:{job.id}",
+        payload["reply_channel"],
+        (
+            f"*{request.employee.name}'s {leave_name(request.leave_type)} request* "
+            f"was overridden to *{request.status}*."
+        ),
+    )
+    _queue_message(
+        db,
+        f"override-employee-result:{job.id}",
+        request.employee.slack_user_id,
+        (
+            f"HR changed your {leave_name(request.leave_type)} request to "
+            f"*{request.status}*.\n*Reason:* {payload['reason']}"
+        ),
     )
 
 

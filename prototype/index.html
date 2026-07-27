@@ -370,7 +370,9 @@
         $("employees").innerHTML = state.employees
           .map((employee) => {
             const balances = Object.entries(employee.balances)
-              .map(([type, days]) => `${type}: ${days} taken`)
+              .map(([type, balance]) =>
+                `${type}: ${balance.used} used / ${balance.allocated} allocated / ${balance.remaining} remaining`
+              )
               .join(" | ");
             return `
               <div class="item">

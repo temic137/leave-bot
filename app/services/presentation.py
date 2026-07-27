@@ -19,6 +19,6 @@ def readable_status(status: str) -> str:
     labels = {
         "pending_manager": "Waiting for manager approval",
         "pending_hr": "Waiting for HR approval",
+        "pending_cancellation_manager": "Waiting for cancellation approval",
     }
     return labels.get(status, status.replace("_", " ").title())
-

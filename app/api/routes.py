@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.adapters.slack import RealSlackClient
 from app.core.config import settings
-from app.db.models import DurableJob, Employee, LeavePolicyVersion, LeaveRequest
+from app.db.models import DurableJob, Employee, LeavePolicyVersion, LeaveRequest, LeaveRequestStatus
 from app.db.session import get_db
 from app.schemas.leave import BalanceRead, LeaveRequestCreate, LeaveRequestRead
 from app.services.balances import BalanceService
@@ -236,6 +236,10 @@ def admin_state(db: Session = Depends(get_db)) -> dict:
         [employee.id for employee in employees],
         target_year,
     )
+    grouped_allocations = balance_service.get_allocated_days_for_employees(
+        [employee.id for employee in employees],
+        target_year,
+    )
 
     return {
         "employees": [
@@ -250,7 +254,14 @@ def admin_state(db: Session = Depends(get_db)) -> dict:
                 "manager_id": employee.manager_id,
                 "manager_name": employee.manager.name if employee.manager else None,
                 "balances": {
-                    leave_type: grouped_balances.get(employee.id, {}).get(leave_type, 0.0)
+                    leave_type: {
+                        "allocated": grouped_allocations[employee.id][leave_type],
+                        "used": grouped_balances.get(employee.id, {}).get(leave_type, 0.0),
+                        "remaining": (
+                            grouped_allocations[employee.id][leave_type]
+                            - grouped_balances.get(employee.id, {}).get(leave_type, 0.0)
+                        ),
+                    }
                     for leave_type in leave_policy.all()
                 },
             }
@@ -390,8 +401,14 @@ async def slack_interactions(
             return _submit_employee_balance_search(payload, db)
         if callback_id == "department_balance_submission":
             return _submit_department_balance(payload, db)
+        if callback_id == "balance_adjustment_submission":
+            return _submit_balance_adjustment(payload, db)
+        if callback_id == "request_override_submission":
+            return _submit_request_override(payload, db)
         return _submit_leave_modal(payload, db)
     if payload.get("type") == "block_suggestion":
+        if payload.get("action_id") == "override_request_search":
+            return _request_override_options(payload, db)
         return _employee_balance_options(payload, db)
 
     action = (payload.get("actions") or [{}])[0]
@@ -400,6 +417,8 @@ async def slack_interactions(
         "open_leave_request_modal",
         "open_balance_employee_search",
         "open_balance_department_filter",
+        "open_balance_adjustment",
+        "open_request_override",
     }:
         user_id = payload.get("user", {}).get("id", "")
         employee = _employee_by_slack(db, user_id, payload.get("team", {}).get("id"))
@@ -416,7 +435,7 @@ async def slack_interactions(
             return _ephemeral("Only managers and HR can search employee balances.")
         elif action_id == "open_balance_employee_search":
             slack.open_employee_balance_search_modal(trigger_id)
-        else:
+        elif action_id == "open_balance_department_filter":
             departments = db.scalars(
                 _visible_employee_query(employee)
                 .with_only_columns(Employee.department)
@@ -425,6 +444,13 @@ async def slack_interactions(
                 .order_by(Employee.department)
             ).all()
             slack.open_department_balance_modal(trigger_id, departments)
+        elif employee.role not in {"hr", "admin"}:
+            return _ephemeral("Only HR can manage balances or override requests.")
+        elif action_id == "open_balance_adjustment":
+            _sync_policy_from_db(db)
+            slack.open_balance_adjustment_modal(trigger_id, leave_policy.all())
+        else:
+            slack.open_request_override_modal(trigger_id)
         return {"ok": True}
 
     interaction_id = action.get("action_ts") or payload.get("trigger_id") or hashlib.sha256(raw_body).hexdigest()
@@ -528,6 +554,177 @@ def _submit_department_balance(payload: dict, db: Session) -> dict:
             "requester_id": requester.id,
             "department": None if department == "__all__" else department,
             "page": 0,
+        },
+    )
+    db.commit()
+    return {"response_action": "clear"}
+
+
+def _submit_balance_adjustment(payload: dict, db: Session) -> dict:
+    _sync_policy_from_db(db)
+    requester = _employee_by_slack(
+        db,
+        payload.get("user", {}).get("id", ""),
+        payload.get("team", {}).get("id"),
+    )
+    state = payload.get("view", {}).get("state", {}).get("values", {})
+    selected = _modal_value(
+        state,
+        "employee",
+        "balance_employee_search",
+        "selected_option",
+        "value",
+    )
+    leave_type = _modal_value(
+        state,
+        "leave_type",
+        "adjustment_leave_type",
+        "selected_option",
+        "value",
+    )
+    days = _modal_value(state, "days", "adjustment_days", "value")
+    reason = _modal_value(state, "reason", "adjustment_reason", "value")
+    errors = {}
+    try:
+        employee_id = int(selected)
+    except (TypeError, ValueError):
+        employee_id = None
+        errors["employee"] = "Choose an employee."
+    try:
+        days_delta = float(days)
+        if days_delta == 0:
+            errors["days"] = "The adjustment cannot be zero."
+    except (TypeError, ValueError):
+        days_delta = None
+        errors["days"] = "Enter a valid number of days."
+    if requester is None or requester.role not in {"hr", "admin"}:
+        errors["employee"] = "Only HR can adjust balances."
+    target = (
+        db.scalar(_visible_employee_query(requester).where(Employee.id == employee_id))
+        if requester and employee_id
+        else None
+    )
+    if target is None:
+        errors["employee"] = "Choose an employee you are allowed to manage."
+    if leave_type not in leave_policy.all():
+        errors["leave_type"] = "Choose a valid leave type."
+    if not (reason or "").strip():
+        errors["reason"] = "Enter a reason for this adjustment."
+    if errors:
+        return _modal_errors(errors)
+    enqueue_job(
+        db,
+        "adjust_leave_balance",
+        f"balance-adjustment:{payload.get('view', {}).get('id')}",
+        {
+            "adjuster_id": requester.id,
+            "employee_id": target.id,
+            "leave_type": leave_type,
+            "year": date.today().year,
+            "days_delta": days_delta,
+            "reason": reason.strip(),
+            "reply_channel": requester.slack_user_id,
+        },
+    )
+    db.commit()
+    return {"response_action": "clear"}
+
+
+def _request_override_options(payload: dict, db: Session) -> dict:
+    requester = _employee_by_slack(
+        db,
+        payload.get("user", {}).get("id", ""),
+        payload.get("team", {}).get("id"),
+    )
+    if requester is None or requester.role not in {"hr", "admin"}:
+        return {"options": []}
+    search = payload.get("value", "").strip()
+    query = (
+        select(LeaveRequest)
+        .join(Employee, LeaveRequest.employee_id == Employee.id)
+        .where(Employee.workspace_id == requester.workspace_id)
+        .order_by(LeaveRequest.id.desc())
+        .limit(100)
+    )
+    if search:
+        query = query.where(Employee.name.ilike(f"%{search}%"))
+    requests = db.scalars(query).all()
+    return {
+        "options": [
+            {
+                "text": {
+                    "type": "plain_text",
+                    "text": (
+                        f"{request.employee.name} | {leave_name(request.leave_type)} | "
+                        f"{request.start_date} | {readable_status(request.status)}"
+                    )[:75],
+                },
+                "value": str(request.id),
+            }
+            for request in requests
+        ]
+    }
+
+
+def _submit_request_override(payload: dict, db: Session) -> dict:
+    requester = _employee_by_slack(
+        db,
+        payload.get("user", {}).get("id", ""),
+        payload.get("team", {}).get("id"),
+    )
+    state = payload.get("view", {}).get("state", {}).get("values", {})
+    selected = _modal_value(
+        state,
+        "request",
+        "override_request_search",
+        "selected_option",
+        "value",
+    )
+    status = _modal_value(
+        state,
+        "status",
+        "override_status",
+        "selected_option",
+        "value",
+    )
+    reason = _modal_value(state, "reason", "override_reason", "value")
+    try:
+        request_id = int(selected)
+    except (TypeError, ValueError):
+        request_id = None
+    request = (
+        db.scalar(
+            select(LeaveRequest)
+            .join(Employee, LeaveRequest.employee_id == Employee.id)
+            .where(
+                LeaveRequest.id == request_id,
+                Employee.workspace_id == requester.workspace_id,
+            )
+        )
+        if requester and request_id
+        else None
+    )
+    errors = {}
+    if requester is None or requester.role not in {"hr", "admin"}:
+        errors["request"] = "Only HR can override requests."
+    elif request is None:
+        errors["request"] = "Choose a request from your workspace."
+    if status not in {"approved", "rejected", "cancelled"}:
+        errors["status"] = "Choose a valid status."
+    if not (reason or "").strip():
+        errors["reason"] = "Enter a reason for the override."
+    if errors:
+        return _modal_errors(errors)
+    enqueue_job(
+        db,
+        "override_leave_request",
+        f"request-override:{payload.get('view', {}).get('id')}",
+        {
+            "approver_id": requester.id,
+            "leave_request_id": request.id,
+            "status": status,
+            "reason": reason.strip(),
+            "reply_channel": requester.slack_user_id,
         },
     )
     db.commit()
@@ -665,6 +862,37 @@ def _process_chat(payload: ChatIn, db: Session) -> dict:
     approval_result = _handle_chat_approval(normalized, employee, db)
     if approval_result is not None:
         return approval_result
+    cancellation_match = re.search(
+        r"\bcancel(?:lation)?\b(?:\s+(?:request|leave))?\s*#?\s*(\d+)",
+        normalized,
+    )
+    if cancellation_match:
+        return _handle_cancellation(employee, int(cancellation_match.group(1)), db)
+    if "cancel" in normalized and "leave" in normalized:
+        history = _history_result(db, employee)
+        history["reply"] = (
+            "*Choose a request to cancel below.*\n\n" + history["reply"]
+        )
+        return history
+    if employee.role in {"hr", "admin"} and (
+        ("adjust" in normalized and "balance" in normalized)
+        or ("override" in normalized and ("request" in normalized or "leave" in normalized))
+    ):
+        count = (
+            db.scalar(
+                select(func.count()).select_from(
+                    _visible_employee_query(employee).subquery()
+                )
+            )
+            or 0
+        )
+        result = _balance_report_menu_result(count, can_manage=True)
+        result["reply"] = (
+            "*HR leave controls*\n"
+            "*Adjust balance* adds or removes allocated days with a recorded reason. "
+            "*Override request* changes a request's final status and records who made the change."
+        )
+        return result
 
     try:
         match = get_intent_router().classify(payload.text)
@@ -730,10 +958,17 @@ def _taken_balances(db: Session, employee: Employee) -> dict[str, float]:
     return {leave_type: grouped.get(employee.id, {}).get(leave_type, 0.0) for leave_type in leave_policy.all()}
 
 
-def _format_balance_reply(employee: Employee, balances: dict[str, float]) -> str:
+def _format_balance_reply(
+    employee: Employee,
+    balances: dict[str, float],
+    allocations: dict[str, float] | None = None,
+) -> str:
     rows = []
     for leave_type, used in balances.items():
-        allocated = leave_policy.get(leave_type).annual_days
+        allocated = (allocations or {}).get(
+            leave_type,
+            leave_policy.get(leave_type).annual_days,
+        )
         remaining = allocated - used
         filled = 10 if allocated == 0 and used else round(min(used / allocated, 1) * 10) if allocated else 0
         rows.append(
@@ -743,10 +978,14 @@ def _format_balance_reply(employee: Employee, balances: dict[str, float]) -> str
     return f"*Leave balance for {employee.name} in {date.today().year}*\n" + "\n".join(rows)
 
 
-def _format_compact_balance(employee: Employee, balances: dict[str, float]) -> str:
+def _format_compact_balance(
+    employee: Employee,
+    balances: dict[str, float],
+    allocations: dict[str, float],
+) -> str:
     values = []
     for leave_type, used in balances.items():
-        allocated = leave_policy.get(leave_type).annual_days
+        allocated = allocations[leave_type]
         values.append(
             f"{leave_name(leave_type)}: {used:g}/{allocated:g} used, {allocated - used:g} remaining"
         )
@@ -755,10 +994,15 @@ def _format_compact_balance(employee: Employee, balances: dict[str, float]) -> s
 
 def _balance_result(db: Session, employee: Employee) -> dict:
     balances = _taken_balances(db, employee)
+    allocations = BalanceService(db).get_allocated_days_for_employees(
+        [employee.id],
+        date.today().year,
+    )[employee.id]
     return {
         "type": "balance",
-        "reply": _format_balance_reply(employee, balances),
+        "reply": _format_balance_reply(employee, balances, allocations),
         "balances": balances,
+        "allocations": allocations,
     }
 
 
@@ -772,7 +1016,7 @@ def _balance_result_for_query(db: Session, requester: Employee, text: str) -> di
         count = db.scalar(select(func.count()).select_from(_visible_employee_query(requester).subquery())) or 0
         if not count:
             return {"type": "balance", "reply": "You do not have any employees whose balance you can view."}
-        return _balance_report_menu_result(count)
+        return _balance_report_menu_result(count, requester.role in {"hr", "admin"})
 
     visible = db.scalars(_visible_employee_query(requester).order_by(Employee.name)).all()
     matches = [
@@ -792,7 +1036,10 @@ def _balance_result_for_query(db: Session, requester: Employee, text: str) -> di
     asks_for_self = bool(re.search(r"\b(my|mine)\b", normalized))
     if visible and (any(word in normalized for word in target_words) or not asks_for_self):
         return {
-            **_balance_report_menu_result(len(visible)),
+            **_balance_report_menu_result(
+                len(visible),
+                requester.role in {"hr", "admin"},
+            ),
             "reply": (
                 "*Which employee do you mean?*\n"
                 "Please use the employee's name or click *Search employee* below."
@@ -812,9 +1059,10 @@ def _visible_employee_query(requester: Employee):
     return query
 
 
-def _balance_report_menu_result(employee_count: int) -> dict:
+def _balance_report_menu_result(employee_count: int, can_manage: bool = False) -> dict:
     return {
         "type": "balance_report_menu",
+        "can_manage": can_manage,
         "reply": (
             f"*Employee leave report*\n"
             f"*Employees:* {employee_count}\n"
@@ -846,6 +1094,10 @@ def _balance_report_page_result(
         [employee.id for employee in employees],
         date.today().year,
     )
+    allocations = BalanceService(db).get_allocated_days_for_employees(
+        [employee.id for employee in employees],
+        date.today().year,
+    )
     rows = [
         _format_compact_balance(
             employee,
@@ -853,6 +1105,7 @@ def _balance_report_page_result(
                 leave_type: grouped.get(employee.id, {}).get(leave_type, 0.0)
                 for leave_type in leave_policy.all()
             },
+            allocations[employee.id],
         )
         for employee in employees
     ]
@@ -914,7 +1167,28 @@ def _history_result(db: Session, employee: Employee) -> dict:
         f"*Status:* {readable_status(item.status)}"
         for item in requests
     ]
-    return {"type": "history", "reply": "*Your recent leave requests*\n\n" + "\n\n".join(rows)}
+    cancellable_statuses = {
+        LeaveRequestStatus.draft.value,
+        LeaveRequestStatus.pending_manager.value,
+        LeaveRequestStatus.pending_hr.value,
+        LeaveRequestStatus.approved.value,
+    }
+    return {
+        "type": "history",
+        "reply": "*Your recent leave requests*\n\n" + "\n\n".join(rows),
+        "cancellable_requests": [
+            {
+                "id": item.id,
+                "status": item.status,
+                "label": (
+                    f"{leave_name(item.leave_type)}, "
+                    f"{readable_date(item.start_date)} to {readable_date(item.end_date)}"
+                ),
+            }
+            for item in requests
+            if item.status in cancellable_statuses
+        ],
+    }
 
 
 def _status_result(db: Session, employee: Employee) -> dict:
@@ -962,6 +1236,33 @@ def _handle_chat_approval(text: str, approver: Employee, db: Session) -> dict | 
         "approved": approved,
         "approver_id": approver.id,
         "stage": "manager" if request.status == "pending_manager" else "hr",
+        "request": LeaveRequestRead.model_validate(request).model_dump(mode="json"),
+    }
+
+
+def _handle_cancellation(employee: Employee, request_id: int, db: Session) -> dict:
+    request = db.get(LeaveRequest, request_id)
+    if request is None or request.employee_id != employee.id:
+        return {
+            "type": "not_found",
+            "reply": "I could not find that leave request in your history.",
+        }
+    if request.status not in {
+        LeaveRequestStatus.draft.value,
+        LeaveRequestStatus.pending_manager.value,
+        LeaveRequestStatus.pending_hr.value,
+        LeaveRequestStatus.approved.value,
+    }:
+        return {
+            "type": "invalid_cancellation",
+            "reply": f"Your {leave_name(request.leave_type)} request is already {readable_status(request.status).lower()}.",
+        }
+    return {
+        "type": "cancellation_queued",
+        "reply": (
+            f"I am processing cancellation of your "
+            f"*{leave_name(request.leave_type)} request*."
+        ),
         "request": LeaveRequestRead.model_validate(request).model_dump(mode="json"),
     }
 

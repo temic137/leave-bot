@@ -77,7 +77,46 @@ class RealSlackClient(SlackClient):
     def send_employee_menu(self, channel_id: str, text: str) -> None:
         self._post_message(channel=channel_id, text=text, blocks=self._employee_action_blocks(text))
 
-    def send_balance_report_menu(self, channel_id: str, text: str) -> None:
+    def send_balance_report_menu(
+        self,
+        channel_id: str,
+        text: str,
+        can_manage: bool = False,
+    ) -> None:
+        actions = [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Search employee"},
+                "style": "primary",
+                "action_id": "open_balance_employee_search",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "View by department"},
+                "action_id": "open_balance_department_filter",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Download CSV"},
+                "action_id": "download_balance_report",
+                "value": "current_year",
+            },
+        ]
+        if can_manage:
+            actions.extend(
+                [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Adjust balance"},
+                        "action_id": "open_balance_adjustment",
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Override request"},
+                        "action_id": "open_request_override",
+                    },
+                ]
+            )
         self._post_message(
             channel=channel_id,
             text=text,
@@ -85,25 +124,7 @@ class RealSlackClient(SlackClient):
                 {"type": "section", "text": {"type": "mrkdwn", "text": text}},
                 {
                     "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Search employee"},
-                            "style": "primary",
-                            "action_id": "open_balance_employee_search",
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "View by department"},
-                            "action_id": "open_balance_department_filter",
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Download CSV"},
-                            "action_id": "download_balance_report",
-                            "value": "current_year",
-                        },
-                    ],
+                    "elements": actions,
                 },
             ],
         )
@@ -165,6 +186,123 @@ class RealSlackClient(SlackClient):
                                 "options": options,
                             },
                         }
+                    ],
+                },
+            },
+        )
+
+    def open_balance_adjustment_modal(self, trigger_id: str, leave_types: dict) -> None:
+        self._api(
+            "views.open",
+            {
+                "trigger_id": trigger_id,
+                "view": {
+                    "type": "modal",
+                    "callback_id": "balance_adjustment_submission",
+                    "title": {"type": "plain_text", "text": "Adjust balance"},
+                    "submit": {"type": "plain_text", "text": "Apply"},
+                    "close": {"type": "plain_text", "text": "Cancel"},
+                    "blocks": [
+                        {
+                            "type": "input",
+                            "block_id": "employee",
+                            "label": {"type": "plain_text", "text": "Employee"},
+                            "element": {
+                                "type": "external_select",
+                                "action_id": "balance_employee_search",
+                                "min_query_length": 1,
+                                "placeholder": {"type": "plain_text", "text": "Type an employee name"},
+                            },
+                        },
+                        {
+                            "type": "input",
+                            "block_id": "leave_type",
+                            "label": {"type": "plain_text", "text": "Leave type"},
+                            "element": {
+                                "type": "static_select",
+                                "action_id": "adjustment_leave_type",
+                                "options": [
+                                    {
+                                        "text": {"type": "plain_text", "text": rule.display_name},
+                                        "value": key,
+                                    }
+                                    for key, rule in leave_types.items()
+                                ],
+                            },
+                        },
+                        {
+                            "type": "input",
+                            "block_id": "days",
+                            "label": {"type": "plain_text", "text": "Days to add or remove"},
+                            "hint": {"type": "plain_text", "text": "Use a negative number to remove days."},
+                            "element": {
+                                "type": "number_input",
+                                "action_id": "adjustment_days",
+                                "is_decimal_allowed": True,
+                            },
+                        },
+                        {
+                            "type": "input",
+                            "block_id": "reason",
+                            "label": {"type": "plain_text", "text": "Reason"},
+                            "element": {
+                                "type": "plain_text_input",
+                                "action_id": "adjustment_reason",
+                                "multiline": True,
+                            },
+                        },
+                    ],
+                },
+            },
+        )
+
+    def open_request_override_modal(self, trigger_id: str) -> None:
+        self._api(
+            "views.open",
+            {
+                "trigger_id": trigger_id,
+                "view": {
+                    "type": "modal",
+                    "callback_id": "request_override_submission",
+                    "title": {"type": "plain_text", "text": "Override request"},
+                    "submit": {"type": "plain_text", "text": "Apply override"},
+                    "close": {"type": "plain_text", "text": "Cancel"},
+                    "blocks": [
+                        {
+                            "type": "input",
+                            "block_id": "request",
+                            "label": {"type": "plain_text", "text": "Leave request"},
+                            "element": {
+                                "type": "external_select",
+                                "action_id": "override_request_search",
+                                "min_query_length": 0,
+                                "placeholder": {"type": "plain_text", "text": "Search by employee name"},
+                            },
+                        },
+                        {
+                            "type": "input",
+                            "block_id": "status",
+                            "label": {"type": "plain_text", "text": "New status"},
+                            "element": {
+                                "type": "static_select",
+                                "action_id": "override_status",
+                                "options": [
+                                    {"text": {"type": "plain_text", "text": "Approved"}, "value": "approved"},
+                                    {"text": {"type": "plain_text", "text": "Rejected"}, "value": "rejected"},
+                                    {"text": {"type": "plain_text", "text": "Cancelled"}, "value": "cancelled"},
+                                ],
+                            },
+                        },
+                        {
+                            "type": "input",
+                            "block_id": "reason",
+                            "label": {"type": "plain_text", "text": "Reason"},
+                            "element": {
+                                "type": "plain_text_input",
+                                "action_id": "override_reason",
+                                "multiline": True,
+                            },
+                        },
                     ],
                 },
             },
@@ -355,23 +493,26 @@ class RealSlackClient(SlackClient):
         days: float,
         document_url: str | None = None,
         reason: str | None = None,
-    ) -> None:
-        from app.services.presentation import leave_name, readable_date
-
-        summary = (
-            f"*Leave request from {employee_name}*\n"
-            f"*Leave type:* {leave_name(leave_type)}\n"
-            f"*Dates:* {readable_date(start_date)} to {readable_date(end_date)}\n"
-            f"*Working days:* {days:g}\n"
-            f"*Reason:* {reason or 'No reason provided'}"
-        )
-        if document_url:
-            summary += f"\n*Document:* <{document_url}|Open supporting document>"
-        self._post_message(
+    ) -> dict:
+        return self._post_message(
             channel=slack_user_id,
-            text=f"{employee_name} submitted a {leave_name(leave_type)} request.",
+            text=f"{employee_name} submitted a leave request.",
             blocks=[
-                {"type": "section", "text": {"type": "mrkdwn", "text": summary}},
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": self._leave_request_summary(
+                            employee_name,
+                            leave_type,
+                            start_date,
+                            end_date,
+                            days,
+                            document_url,
+                            reason,
+                        ),
+                    },
+                },
                 {
                     "type": "actions",
                     "elements": [
@@ -393,6 +534,158 @@ class RealSlackClient(SlackClient):
                 },
             ],
         )
+
+    def update_leave_card(
+        self,
+        channel_id: str,
+        message_ts: str,
+        employee_name: str,
+        leave_type: str,
+        start_date: str,
+        end_date: str,
+        days: float,
+        document_url: str | None,
+        reason: str | None,
+        status: str,
+    ) -> None:
+        from app.services.presentation import readable_status
+
+        summary = self._leave_request_summary(
+            employee_name,
+            leave_type,
+            start_date,
+            end_date,
+            days,
+            document_url,
+            reason,
+        )
+        self._api(
+            "chat.update",
+            {
+                "channel": channel_id,
+                "ts": message_ts,
+                "text": f"{employee_name}'s leave request is {readable_status(status).lower()}.",
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": summary}},
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": f"*Status:* {readable_status(status)}",
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+
+    def send_cancellation_approval(
+        self,
+        slack_user_id: str,
+        request_id: int,
+        employee_name: str,
+        leave_type: str,
+        start_date: str,
+        end_date: str,
+        days: float,
+    ) -> dict:
+        from app.services.presentation import leave_name, readable_date
+
+        text = (
+            f"*Cancellation request from {employee_name}*\n"
+            f"*Leave type:* {leave_name(leave_type)}\n"
+            f"*Dates:* {readable_date(start_date)} to {readable_date(end_date)}\n"
+            f"*Working days:* {days:g}"
+        )
+        return self._post_message(
+            channel=slack_user_id,
+            text=f"{employee_name} requested cancellation of approved leave.",
+            blocks=[
+                {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Approve cancellation"},
+                            "style": "primary",
+                            "action_id": "approve_leave_cancellation",
+                            "value": str(request_id),
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Keep leave"},
+                            "style": "danger",
+                            "action_id": "reject_leave_cancellation",
+                            "value": str(request_id),
+                        },
+                    ],
+                },
+            ],
+        )
+
+    def send_leave_history(
+        self,
+        channel_id: str,
+        text: str,
+        cancellable_requests: list[dict],
+    ) -> None:
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+        for request in cancellable_requests:
+            label = (
+                "Request cancellation"
+                if request["status"] == "approved"
+                else "Cancel request"
+            )
+            blocks.append(
+                {
+                    "type": "actions",
+                    "block_id": f"cancel_request_{request['id']}",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": f"{label}: {request['label']}"[:75]},
+                            "style": "danger",
+                            "action_id": "cancel_leave",
+                            "value": str(request["id"]),
+                            "confirm": {
+                                "title": {"type": "plain_text", "text": label},
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": f"Continue with *{request['label']}*?",
+                                },
+                                "confirm": {"type": "plain_text", "text": "Continue"},
+                                "deny": {"type": "plain_text", "text": "Go back"},
+                            },
+                        }
+                    ],
+                }
+            )
+        self._post_message(channel=channel_id, text=text, blocks=blocks)
+
+    @staticmethod
+    def _leave_request_summary(
+        employee_name: str,
+        leave_type: str,
+        start_date: str,
+        end_date: str,
+        days: float,
+        document_url: str | None,
+        reason: str | None,
+    ) -> str:
+        from app.services.presentation import leave_name, readable_date
+
+        summary = (
+            f"*Leave request from {employee_name}*\n"
+            f"*Leave type:* {leave_name(leave_type)}\n"
+            f"*Dates:* {readable_date(start_date)} to {readable_date(end_date)}\n"
+            f"*Working days:* {days:g}\n"
+            f"*Reason:* {reason or 'No reason provided'}"
+        )
+        if document_url:
+            summary += f"\n*Document:* <{document_url}|Open supporting document>"
+        return summary
 
     def list_users(self) -> list[SlackUser]:
         data = self._api("users.list", {})
@@ -454,11 +747,11 @@ class RealSlackClient(SlackClient):
             response.content,
         )
 
-    def _post_message(self, channel: str, text: str, blocks: list[dict] | None = None) -> None:
+    def _post_message(self, channel: str, text: str, blocks: list[dict] | None = None) -> dict:
         payload = {"channel": channel, "text": text}
         if blocks:
             payload["blocks"] = blocks
-        self._api("chat.postMessage", payload)
+        return self._api("chat.postMessage", payload)
 
     @staticmethod
     def _employee_action_blocks(text: str) -> list[dict]:

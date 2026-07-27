@@ -14,7 +14,15 @@ from app.main import app
 from app.adapters.slack import RealSlackClient
 from app.adapters.storage import validate_document
 from app.adapters.workflow import AgentSpanApprovalWorkflow
-from app.db.models import DurableJob, Employee, LeavePolicyVersion, LeaveRequest, LeaveRequestStatus
+from app.db.models import (
+    ApprovalEvent,
+    DurableJob,
+    Employee,
+    LeaveBalanceAdjustment,
+    LeavePolicyVersion,
+    LeaveRequest,
+    LeaveRequestStatus,
+)
 from app.db.session import Base
 from app.schemas.leave import LeaveRequestCreate
 from app.services.balances import BalanceService
@@ -53,10 +61,11 @@ def seed_people(db: Session) -> tuple[Employee, Employee, Employee]:
     return employee, manager, hr
 
 
-def test_database_schema_has_five_business_tables_and_one_job_table() -> None:
+def test_database_schema_has_six_business_tables_and_one_job_table() -> None:
     assert set(Base.metadata.tables) == {
         "employees",
         "leave_requests",
+        "leave_balance_adjustments",
         "approval_events",
         "leave_policy_versions",
         "durable_jobs",
@@ -748,3 +757,200 @@ def test_csv_report_contains_only_authorized_employees(db: Session, monkeypatch)
     assert "Employee" in captured["content"]
     assert "Annual Leave" in captured["content"]
     assert "Outside CSV" not in captured["content"]
+
+
+def test_approval_card_update_removes_action_buttons(monkeypatch) -> None:
+    sent = {}
+    client = RealSlackClient(token="test-token")
+    monkeypatch.setattr(
+        client,
+        "_api",
+        lambda method, payload: sent.update({"method": method, "payload": payload}) or {"ok": True},
+    )
+
+    client.update_leave_card(
+        "D_MANAGER",
+        "123.456",
+        "Employee",
+        "annual",
+        "2026-07-06",
+        "2026-07-07",
+        2,
+        None,
+        "Family event",
+        "approved",
+    )
+
+    assert sent["method"] == "chat.update"
+    assert sent["payload"]["channel"] == "D_MANAGER"
+    assert all(block["type"] != "actions" for block in sent["payload"]["blocks"])
+    assert "Approved" in sent["payload"]["blocks"][1]["elements"][0]["text"]
+
+
+def test_history_message_has_cancellation_buttons(monkeypatch) -> None:
+    sent = {}
+    client = RealSlackClient(token="test-token")
+    monkeypatch.setattr(
+        client,
+        "_api",
+        lambda method, payload: sent.update(payload) or {"ok": True},
+    )
+
+    client.send_leave_history(
+        "U_EMPLOYEE",
+        "History",
+        [
+            {"id": 1, "status": "pending_manager", "label": "Annual Leave, 6 July"},
+            {"id": 2, "status": "approved", "label": "Sick Leave, 8 July"},
+        ],
+    )
+
+    buttons = [block["elements"][0] for block in sent["blocks"] if block["type"] == "actions"]
+    assert [button["action_id"] for button in buttons] == ["cancel_leave", "cancel_leave"]
+    assert buttons[0]["text"]["text"].startswith("Cancel request")
+    assert buttons[1]["text"]["text"].startswith("Request cancellation")
+
+
+def test_approved_cancellation_waits_for_manager_and_restores_balance(db: Session) -> None:
+    employee, manager, _hr = seed_people(db)
+    request = LeaveRequest(
+        employee_id=employee.id,
+        leave_type="annual",
+        start_date=date(2026, 7, 6),
+        end_date=date(2026, 7, 7),
+        days_requested=2,
+        status=LeaveRequestStatus.approved.value,
+    )
+    db.add(request)
+    db.flush()
+    service = LeaveRequestService(db)
+
+    assert service.request_cancellation(employee, request)
+    db.flush()
+    assert request.status == LeaveRequestStatus.pending_cancellation_manager.value
+    assert BalanceService(db).get_taken_days(employee.id, "annual", 2026) == 2
+
+    service.record_cancellation_decision(manager, request, approved=True)
+    db.flush()
+    assert request.status == LeaveRequestStatus.cancelled.value
+    assert BalanceService(db).get_taken_days(employee.id, "annual", 2026) == 0
+    assert db.query(ApprovalEvent).filter_by(leave_request_id=request.id).count() == 2
+
+
+def test_pending_request_cancels_immediately(db: Session) -> None:
+    employee, _manager, _hr = seed_people(db)
+    request = LeaveRequest(
+        employee_id=employee.id,
+        leave_type="annual",
+        start_date=date(2026, 7, 6),
+        end_date=date(2026, 7, 7),
+        days_requested=2,
+        status=LeaveRequestStatus.pending_manager.value,
+    )
+    db.add(request)
+    db.flush()
+
+    assert not LeaveRequestService(db).request_cancellation(employee, request)
+    assert request.status == LeaveRequestStatus.cancelled.value
+
+
+def test_hr_balance_adjustment_changes_allocation_and_is_audited(db: Session) -> None:
+    employee, _manager, hr = seed_people(db)
+    employee.workspace_id = hr.workspace_id = "T_TEST"
+    service = BalanceService(db)
+
+    adjustment = service.adjust_allocation(
+        hr,
+        employee,
+        "annual",
+        2026,
+        5,
+        "Contract entitlement correction",
+    )
+
+    assert isinstance(adjustment, LeaveBalanceAdjustment)
+    assert adjustment.adjusted_by_id == hr.id
+    assert service.get_allocated_days(employee.id, "annual", 2026) == 25
+    assert service.get_remaining_days(employee.id, "annual", 2026) == 25
+
+
+def test_balance_adjustment_changes_request_entitlement(db: Session) -> None:
+    employee, _manager, hr = seed_people(db)
+    employee.workspace_id = hr.workspace_id = "T_TEST"
+    BalanceService(db).adjust_allocation(
+        hr,
+        employee,
+        "annual",
+        2026,
+        5,
+        "Additional contractual allowance",
+    )
+
+    request = LeaveRequestService(db).create_request(
+        LeaveRequestCreate(
+            employee_id=employee.id,
+            leave_type="annual",
+            start_date=date(2026, 8, 3),
+            end_date=date(2026, 8, 31),
+            reason="Extended leave",
+        )
+    )
+
+    assert float(request.days_requested) == 21
+
+
+def test_hr_message_exposes_balance_and_override_controls(db: Session, monkeypatch) -> None:
+    employee, _manager, hr = seed_people(db)
+    employee.workspace_id = hr.workspace_id = "T_TEST"
+    monkeypatch.setattr(routes, "_sync_policy_from_db", lambda session: None)
+
+    result = routes._process_chat(
+        routes.ChatIn(
+            slack_user_id=hr.slack_user_id,
+            workspace_id=hr.workspace_id,
+            text="I need to adjust an employee balance",
+        ),
+        db,
+    )
+
+    assert result["type"] == "balance_report_menu"
+    assert result["can_manage"] is True
+    assert "Adjust balance" in result["reply"]
+    assert "Override request" in result["reply"]
+
+
+def test_hr_override_is_workspace_scoped_and_audited(db: Session) -> None:
+    employee, _manager, hr = seed_people(db)
+    employee.workspace_id = hr.workspace_id = "T_TEST"
+    request = LeaveRequest(
+        employee_id=employee.id,
+        leave_type="annual",
+        start_date=date(2026, 7, 6),
+        end_date=date(2026, 7, 7),
+        days_requested=2,
+        status=LeaveRequestStatus.rejected.value,
+    )
+    db.add(request)
+    db.flush()
+
+    LeaveRequestService(db).override_request(
+        hr,
+        request,
+        "approved",
+        "Approved after policy review",
+    )
+    db.flush()
+
+    event_row = db.query(ApprovalEvent).filter_by(leave_request_id=request.id).one()
+    assert request.status == LeaveRequestStatus.approved.value
+    assert event_row.decision == "override_approved"
+    assert event_row.comment == "Approved after policy review"
+
+    hr.workspace_id = "T_OTHER"
+    with pytest.raises(ValueError, match="not allowed"):
+        LeaveRequestService(db).override_request(
+            hr,
+            request,
+            "cancelled",
+            "Wrong workspace",
+        )

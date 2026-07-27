@@ -13,6 +13,7 @@ class WorkflowHandle:
 class AgentSpanApprovalWorkflow:
     manager_workflow = "leave_approval_manager_v1"
     hr_workflow = "leave_approval_manager_hr_v1"
+    cancellation_workflow = "leave_cancellation_manager_v1"
 
     def __init__(self, server_url: str | None = None, timeout: float = 10):
         self.server_url = (server_url or settings.agentspan_server_url).rstrip("/")
@@ -30,6 +31,7 @@ class AgentSpanApprovalWorkflow:
     def register_workflows(self) -> None:
         self._ensure_registered(False)
         self._ensure_registered(True)
+        self.ensure_cancellation_registered()
 
     def ensure_registered(self, requires_hr: bool) -> None:
         self._ensure_registered(requires_hr)
@@ -58,24 +60,83 @@ class AgentSpanApprovalWorkflow:
         )
         return WorkflowHandle(execution_id=response.text.strip('"'))
 
+    def ensure_cancellation_registered(self) -> None:
+        response = httpx.get(
+            f"{self.server_url}/api/metadata/workflow/{self.cancellation_workflow}",
+            params={"version": 1},
+            timeout=self.timeout,
+        )
+        if response.status_code == 404:
+            self._request(
+                "POST",
+                "/api/metadata/workflow",
+                json={
+                    "name": self.cancellation_workflow,
+                    "description": "Durable approved leave cancellation",
+                    "version": 1,
+                    "schemaVersion": 2,
+                    "inputParameters": ["leave_request_id"],
+                    "tasks": [self._human_task("manager_cancellation_approval")],
+                    "outputParameters": {
+                        "leave_request_id": "${workflow.input.leave_request_id}"
+                    },
+                    "restartable": True,
+                    "ownerEmail": "leave-bot@local",
+                },
+            )
+            return
+        response.raise_for_status()
+
+    def start_cancellation(
+        self,
+        leave_request_id: int,
+        attempt_id: int | None = None,
+    ) -> WorkflowHandle:
+        correlation_id = f"leave-cancellation-{leave_request_id}"
+        if attempt_id is not None:
+            correlation_id += f"-{attempt_id}"
+        response = self._request(
+            "POST",
+            f"/api/workflow/{self.cancellation_workflow}",
+            params={
+                "version": 1,
+                "correlationId": correlation_id,
+            },
+            json={"leave_request_id": leave_request_id},
+        )
+        return WorkflowHandle(execution_id=response.text.strip('"'))
+
     def decide(self, execution_id: str, approved: bool, reason: str = "", stage: str | None = None) -> None:
         if not approved:
-            response = httpx.request(
-                "DELETE",
-                self.server_url + f"/api/workflow/{execution_id}",
-                params={"reason": reason or "Leave request rejected"},
-                timeout=self.timeout,
-            )
-            if getattr(response, "status_code", 200) != 404:
-                response.raise_for_status()
+            self.cancel(execution_id, reason or "Leave request rejected")
             return
+        self._complete_task(
+            execution_id,
+            f"{stage}_approval" if stage else None,
+        )
 
+    def decide_cancellation(self, execution_id: str, approved: bool) -> None:
+        if not approved:
+            self.cancel(execution_id, "Leave cancellation rejected")
+            return
+        self._complete_task(execution_id, "manager_cancellation_approval")
+
+    def cancel(self, execution_id: str, reason: str) -> None:
+        response = httpx.request(
+            "DELETE",
+            self.server_url + f"/api/workflow/{execution_id}",
+            params={"reason": reason},
+            timeout=self.timeout,
+        )
+        if getattr(response, "status_code", 200) != 404:
+            response.raise_for_status()
+
+    def _complete_task(self, execution_id: str, task_reference: str | None) -> None:
         execution = self._request(
             "GET",
             f"/api/workflow/{execution_id}",
             params={"includeTasks": "true"},
         ).json()
-        task_reference = f"{stage}_approval" if stage else None
         matching_tasks = [
             task
             for task in execution.get("tasks", [])
@@ -90,7 +151,9 @@ class AgentSpanApprovalWorkflow:
             return
         active_tasks = [task for task in matching_tasks if task.get("status") == "IN_PROGRESS"]
         if len(active_tasks) != 1:
-            raise RuntimeError(f"Expected one active AgentSpan {stage or ''} approval task, found {len(active_tasks)}")
+            raise RuntimeError(
+                f"Expected one active AgentSpan {task_reference or ''} task, found {len(active_tasks)}"
+            )
         task = active_tasks[0]
         self._request(
             "POST",

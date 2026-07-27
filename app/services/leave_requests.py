@@ -53,7 +53,12 @@ class LeaveRequestService:
             payload.leave_type,
             payload.start_date.year,
         )
-        remaining = rule.annual_days - committed
+        allocated = self.balances.get_allocated_days(
+            payload.employee_id,
+            payload.leave_type,
+            payload.start_date.year,
+        )
+        remaining = allocated - committed
         if days_requested > remaining:
             raise ValueError(
                 f"This request needs {days_requested:g} working days, but only "
@@ -97,13 +102,110 @@ class LeaveRequestService:
             request.decided_at = datetime.now(UTC)
         return request
 
+    def request_cancellation(self, employee: Employee, request: LeaveRequest) -> bool:
+        if request.employee_id != employee.id:
+            raise ValueError("You can only cancel your own leave request.")
+        if request.status in {
+            LeaveRequestStatus.draft.value,
+            LeaveRequestStatus.pending_manager.value,
+            LeaveRequestStatus.pending_hr.value,
+        }:
+            request.status = LeaveRequestStatus.cancelled.value
+            request.decided_at = datetime.now(UTC)
+            self._record_event(employee, request, "employee", "cancelled", "Cancelled by employee")
+            return False
+        if request.status == LeaveRequestStatus.approved.value:
+            request.status = LeaveRequestStatus.pending_cancellation_manager.value
+            request.decided_at = None
+            self._record_event(
+                employee,
+                request,
+                "employee",
+                "cancellation_requested",
+                "Cancellation requested by employee",
+            )
+            return True
+        raise ValueError(f"This request is already {request.status.replace('_', ' ')}.")
+
+    def record_cancellation_decision(
+        self,
+        approver: Employee,
+        request: LeaveRequest,
+        approved: bool,
+    ) -> LeaveRequest:
+        if request.status != LeaveRequestStatus.pending_cancellation_manager.value:
+            raise ValueError("This request is not waiting for a cancellation decision.")
+        if request.employee.manager_id != approver.id and approver.role != "admin":
+            raise ValueError("You are not allowed to decide this cancellation.")
+        request.status = (
+            LeaveRequestStatus.cancelled.value
+            if approved
+            else LeaveRequestStatus.approved.value
+        )
+        request.decided_at = datetime.now(UTC)
+        self._record_event(
+            approver,
+            request,
+            approver.role,
+            "cancellation_approved" if approved else "cancellation_rejected",
+            "Slack cancellation decision",
+        )
+        return request
+
+    def override_request(
+        self,
+        approver: Employee,
+        request: LeaveRequest,
+        status: str,
+        reason: str,
+    ) -> LeaveRequest:
+        if (
+            approver.role not in {"hr", "admin"}
+            or approver.workspace_id != request.employee.workspace_id
+        ):
+            raise ValueError("You are not allowed to override this request.")
+        if status not in {
+            LeaveRequestStatus.approved.value,
+            LeaveRequestStatus.rejected.value,
+            LeaveRequestStatus.cancelled.value,
+        }:
+            raise ValueError("Choose approved, rejected, or cancelled.")
+        if not reason.strip():
+            raise ValueError("An override reason is required.")
+        request.status = status
+        request.decided_at = datetime.now(UTC)
+        self._record_event(
+            approver,
+            request,
+            approver.role,
+            f"override_{status}",
+            reason.strip(),
+        )
+        return request
+
     def _record_decision(self, approver: Employee, request: LeaveRequest, role: str, approved: bool, comment: str | None) -> None:
+        self._record_event(
+            approver,
+            request,
+            role,
+            "approved" if approved else "rejected",
+            comment,
+        )
+
+    def _record_event(
+        self,
+        approver: Employee,
+        request: LeaveRequest,
+        role: str,
+        decision: str,
+        comment: str | None,
+    ) -> None:
         self.db.add(
             ApprovalEvent(
                 leave_request_id=request.id,
                 approver_id=approver.id,
                 approver_role=role,
-                decision="approved" if approved else "rejected",
+                decision=decision,
                 comment=comment,
             )
         )
