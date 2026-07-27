@@ -422,7 +422,6 @@ def _submit_leave_modal(payload: dict, db: Session) -> dict:
     start_text = _modal_value(state, "start_date", "start_date_select", "selected_date")
     end_text = _modal_value(state, "end_date", "end_date_select", "selected_date")
     reason = _modal_value(state, "reason", "reason_input", "value")
-    document_key = _modal_value(state, "document", "document_input", "value")
     errors = {}
     try:
         start_date = date.fromisoformat(start_text or "")
@@ -440,8 +439,11 @@ def _submit_leave_modal(payload: dict, db: Session) -> dict:
         errors["end_date"] = "The end date cannot be before the start date."
     if leave_type not in leave_policy.all():
         errors["leave_type"] = "Choose a valid leave type."
-    elif leave_policy.get(leave_type).requires_document and not document_key:
-        errors["document"] = "This leave policy requires a document reference."
+    elif leave_policy.get(leave_type).requires_document:
+        errors["leave_type"] = (
+            "This leave type requires a file. File upload is not available yet; "
+            "contact HR or choose a leave type that does not require a document."
+        )
     if errors:
         return _modal_errors(errors)
 
@@ -458,7 +460,7 @@ def _submit_leave_modal(payload: dict, db: Session) -> dict:
                 start_date=start_date,
                 end_date=end_date,
                 reason=reason or None,
-                document_key=document_key or None,
+                document_key=None,
             )
         )
     except ValueError as exc:
@@ -534,15 +536,17 @@ def _process_chat(payload: ChatIn, db: Session) -> dict:
             "reply": (
                 "I can help you submit a leave request. Click *Request leave* below "
                 "to open a form where you can choose the leave type, start and end dates, "
-                "reason, and any required document reference."
+                "and an optional reason."
             ),
         }
     if match and match.intent == "check_balance":
-        return _balance_result(db, employee)
+        return _balance_result_for_query(db, employee, payload.text)
     if match and match.intent == "leave_history":
         return _history_result(db, employee)
     if match and match.intent == "check_status":
         return _status_result(db, employee)
+    if match and match.intent == "pending_requests":
+        return _pending_requests_result(db, employee)
     return {
         "type": "employee_menu",
         "reply": (
@@ -596,6 +600,62 @@ def _balance_result(db: Session, employee: Employee) -> dict:
         "reply": _format_balance_reply(employee, balances),
         "balances": balances,
     }
+
+
+def _balance_result_for_query(db: Session, requester: Employee, text: str) -> dict:
+    normalized = text.lower()
+    if requester.role not in {"manager", "hr", "admin"}:
+        return _balance_result(db, requester)
+
+    query = select(Employee).where(Employee.is_active.is_(True), Employee.id != requester.id)
+    if requester.role == "manager":
+        query = query.where(Employee.manager_id == requester.id)
+    visible = db.scalars(query.order_by(Employee.name)).all()
+
+    team_words = ("team", "direct report", "employees", "everyone", "all balance")
+    if any(word in normalized for word in team_words):
+        if not visible:
+            return {"type": "balance", "reply": "You do not have any employees whose balance you can view."}
+        rows = [_format_balance_reply(person, _taken_balances(db, person)) for person in visible]
+        return {"type": "balance", "reply": "*Employee leave taken this year*\n" + "\n".join(rows)}
+
+    matches = [
+        person
+        for person in visible
+        if person.name.lower() in normalized
+        or any(len(part) >= 3 and part in normalized for part in person.name.lower().split())
+    ]
+    if len(matches) == 1:
+        return _balance_result(db, matches[0])
+    if len(matches) > 1:
+        return {
+            "type": "balance",
+            "reply": "More than one employee matched that name. Please use the employee's full name.",
+        }
+    if visible and any(word in normalized for word in ("employee", "report", "staff member")):
+        names = ", ".join(person.name for person in visible)
+        return {"type": "balance", "reply": f"Whose balance do you want to see? You can ask about: {names}."}
+    return _balance_result(db, requester)
+
+
+def _pending_requests_result(db: Session, requester: Employee) -> dict:
+    if requester.role not in {"manager", "hr", "admin"}:
+        return {"type": "permission_denied", "reply": "Only managers and HR can view pending team requests."}
+
+    query = select(LeaveRequest).where(LeaveRequest.status.in_(["pending_manager", "pending_hr"]))
+    if requester.role == "manager":
+        query = query.join(Employee, LeaveRequest.employee_id == Employee.id).where(
+            Employee.manager_id == requester.id
+        )
+    requests = db.scalars(query.order_by(LeaveRequest.id.desc())).all()
+    if not requests:
+        return {"type": "pending_requests", "reply": "There are no pending leave requests for you."}
+    rows = [
+        f"#{item.id} | {item.employee.name} | {item.leave_type} | "
+        f"{item.start_date} to {item.end_date} | {item.status.replace('_', ' ')}"
+        for item in requests
+    ]
+    return {"type": "pending_requests", "reply": "*Pending leave requests*\n" + "\n".join(rows)}
 
 
 def _history_result(db: Session, employee: Employee) -> dict:

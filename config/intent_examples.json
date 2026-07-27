@@ -67,6 +67,18 @@
     "Show my current request status",
     "Did my manager respond to my leave"
   ],
+  "pending_requests": [
+    "Show pending leave requests",
+    "Which leave requests need my approval",
+    "Show requests waiting for me",
+    "What leave requests are pending",
+    "Show my team's pending requests",
+    "Does anyone need leave approval",
+    "Show pending requests from my employees",
+    "What requests are waiting for HR",
+    "Show all requests awaiting approval",
+    "Who is waiting for a leave decision"
+  ],
   "help": [
     "Help",
     "What can you do",

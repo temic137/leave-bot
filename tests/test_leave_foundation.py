@@ -13,7 +13,7 @@ from app.api import routes
 from app.main import app
 from app.adapters.slack import RealSlackClient
 from app.adapters.workflow import AgentSpanApprovalWorkflow
-from app.db.models import Employee, LeavePolicyVersion, LeaveRequestStatus
+from app.db.models import Employee, LeavePolicyVersion, LeaveRequest, LeaveRequestStatus
 from app.db.session import Base
 from app.schemas.leave import LeaveRequestCreate
 from app.services.balances import BalanceService
@@ -386,3 +386,54 @@ def test_leave_request_button_explains_what_it_opens(monkeypatch) -> None:
     button = sent["payload"]["blocks"][1]["elements"][0]
     assert button["action_id"] == "open_leave_request_modal"
     assert button["text"]["text"] == "Request leave"
+
+
+def test_leave_modal_does_not_offer_fake_document_reference(monkeypatch) -> None:
+    sent = {}
+    client = RealSlackClient(token="test-token")
+    monkeypatch.setattr(client, "_api", lambda method, payload: sent.update(payload) or {"ok": True})
+
+    client.open_leave_request_modal("trigger", LeavePolicy().all())
+
+    block_ids = [block.get("block_id") for block in sent["view"]["blocks"]]
+    assert "document" not in block_ids
+
+
+def test_manager_can_ask_for_direct_report_balance(db: Session) -> None:
+    employee, manager, _hr = seed_people(db)
+    db.add(
+        LeaveRequest(
+            employee_id=employee.id,
+            leave_type="annual",
+            start_date=date.today(),
+            end_date=date.today(),
+            days_requested=2,
+            status=LeaveRequestStatus.approved.value,
+        )
+    )
+    db.flush()
+
+    result = routes._balance_result_for_query(db, manager, "show Employee's leave balance")
+
+    assert result["type"] == "balance"
+    assert "Employee's leave taken this year" in result["reply"]
+    assert "annual: 2 days taken" in result["reply"]
+
+
+def test_hr_can_view_all_pending_requests(db: Session) -> None:
+    employee, _manager, hr = seed_people(db)
+    request = LeaveRequest(
+        employee_id=employee.id,
+        leave_type="annual",
+        start_date=date.today(),
+        end_date=date.today(),
+        days_requested=1,
+        status=LeaveRequestStatus.pending_manager.value,
+    )
+    db.add(request)
+    db.flush()
+
+    result = routes._pending_requests_result(db, hr)
+
+    assert result["type"] == "pending_requests"
+    assert f"#{request.id} | Employee | annual" in result["reply"]

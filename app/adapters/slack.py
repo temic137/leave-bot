@@ -144,20 +144,6 @@ class RealSlackClient(SlackClient):
                                 "multiline": True,
                             },
                         },
-                        {
-                            "type": "input",
-                            "block_id": "document",
-                            "optional": True,
-                            "label": {"type": "plain_text", "text": "Document reference"},
-                            "element": {
-                                "type": "plain_text_input",
-                                "action_id": "document_input",
-                                "placeholder": {
-                                    "type": "plain_text",
-                                    "text": "Only required by some leave policies",
-                                },
-                            },
-                        },
                     ],
                 },
             },
