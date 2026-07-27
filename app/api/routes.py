@@ -52,6 +52,7 @@ class PolicyTextIn(BaseModel):
 class ChatIn(BaseModel):
     slack_user_id: str
     text: str
+    workspace_id: str | None = None
 
 
 class EmployeeIn(BaseModel):
@@ -61,6 +62,7 @@ class EmployeeIn(BaseModel):
     role: str = "employee"
     department: str | None = None
     manager_id: int | None = None
+    workspace_id: str | None = None
 
 
 @router.post("/admin/init-db")
@@ -74,7 +76,13 @@ def sync_real_slack(db: Session = Depends(get_db)) -> dict[str, int]:
     service = EmployeeSyncService(db)
     count = 0
     for user in slack.list_users():
-        service.upsert_slack_user(user.slack_user_id, user.email, user.name, user.is_active)
+        service.upsert_slack_user(
+            user.slack_user_id,
+            user.email,
+            user.name,
+            user.is_active,
+            user.workspace_id,
+        )
         count += 1
     db.commit()
     return {"users_upserted": count}
@@ -92,6 +100,7 @@ def create_employee(payload: EmployeeIn, db: Session = Depends(get_db)) -> dict:
         existing = db.scalar(select(Employee).where(Employee.email == payload.email))
     if existing is None:
         employee = Employee(
+            workspace_id=payload.workspace_id,
             slack_user_id=payload.slack_user_id,
             email=payload.email,
             name=payload.name,
@@ -107,11 +116,14 @@ def create_employee(payload: EmployeeIn, db: Session = Depends(get_db)) -> dict:
         employee.role = payload.role
         employee.department = payload.department
         employee.manager_id = payload.manager_id
+        if payload.workspace_id:
+            employee.workspace_id = payload.workspace_id
     db.flush()
     db.commit()
     db.refresh(employee)
     return {
         "id": employee.id,
+        "workspace_id": employee.workspace_id,
         "slack_user_id": employee.slack_user_id,
         "email": employee.email,
         "name": employee.name,
@@ -224,6 +236,7 @@ def admin_state(db: Session = Depends(get_db)) -> dict:
         "employees": [
             {
                 "id": employee.id,
+                "workspace_id": employee.workspace_id,
                 "slack_user_id": employee.slack_user_id,
                 "name": employee.name,
                 "email": employee.email,
@@ -313,7 +326,7 @@ async def slack_commands(
     form = {key: values[0] for key, values in parse_qs(raw_body.decode("utf-8")).items()}
     command = form.get("command", "")
     user_id = form.get("user_id", "")
-    employee = db.scalar(select(Employee).where(Employee.slack_user_id == user_id))
+    employee = _employee_by_slack(db, user_id, form.get("team_id"))
     if employee is None:
         return _ephemeral("Your Slack account is not registered in the leave system.")
 
@@ -349,7 +362,7 @@ async def slack_commands(
         manager_match = re.search(r"<@([A-Z0-9]+)", form.get("text", ""))
         if not manager_match:
             return _ephemeral("Use `/leave-set-manager @manager`.")
-        manager = db.scalar(select(Employee).where(Employee.slack_user_id == manager_match.group(1)))
+        manager = _employee_by_slack(db, manager_match.group(1), form.get("team_id"))
         if manager is None:
             return _ephemeral("That manager is not registered in the leave system.")
         if manager.id == employee.id:
@@ -383,7 +396,7 @@ async def slack_interactions(
     action = (payload.get("actions") or [{}])[0]
     if action.get("action_id") == "open_leave_request_modal":
         user_id = payload.get("user", {}).get("id", "")
-        employee = db.scalar(select(Employee).where(Employee.slack_user_id == user_id))
+        employee = _employee_by_slack(db, user_id, payload.get("team", {}).get("id"))
         if employee is None:
             return _ephemeral("Your Slack account is not registered in the leave system.")
         trigger_id = payload.get("trigger_id")
@@ -411,7 +424,7 @@ def _submit_leave_modal(payload: dict, db: Session) -> dict:
 
     _sync_policy_from_db(db)
     user_id = payload.get("user", {}).get("id", "")
-    employee = db.scalar(select(Employee).where(Employee.slack_user_id == user_id))
+    employee = _employee_by_slack(db, user_id, payload.get("team", {}).get("id"))
     if employee is None:
         return _modal_errors({"leave_type": "Your Slack account is not registered."})
     if employee.manager is None:
@@ -522,7 +535,7 @@ def _ephemeral(text: str) -> dict[str, str]:
 
 def _process_chat(payload: ChatIn, db: Session) -> dict:
     _sync_policy_from_db(db)
-    employee = db.scalar(select(Employee).where(Employee.slack_user_id == payload.slack_user_id))
+    employee = _employee_by_slack(db, payload.slack_user_id, payload.workspace_id)
     if employee is None:
         return {
             "type": "unknown_user",
@@ -621,7 +634,11 @@ def _balance_result_for_query(db: Session, requester: Employee, text: str) -> di
     if requester.role not in {"manager", "hr", "admin"}:
         return _balance_result(db, requester)
 
-    query = select(Employee).where(Employee.is_active.is_(True), Employee.id != requester.id)
+    query = select(Employee).where(
+        Employee.is_active.is_(True),
+        Employee.id != requester.id,
+        Employee.workspace_id == requester.workspace_id,
+    )
     if requester.role == "manager":
         query = query.where(Employee.manager_id == requester.id)
     visible = db.scalars(query.order_by(Employee.name)).all()
@@ -656,11 +673,16 @@ def _pending_requests_result(db: Session, requester: Employee) -> dict:
     if requester.role not in {"manager", "hr", "admin"}:
         return {"type": "permission_denied", "reply": "Only managers and HR can view pending team requests."}
 
-    query = select(LeaveRequest).where(LeaveRequest.status.in_(["pending_manager", "pending_hr"]))
-    if requester.role == "manager":
-        query = query.join(Employee, LeaveRequest.employee_id == Employee.id).where(
-            Employee.manager_id == requester.id
+    query = (
+        select(LeaveRequest)
+        .join(Employee, LeaveRequest.employee_id == Employee.id)
+        .where(
+            LeaveRequest.status.in_(["pending_manager", "pending_hr"]),
+            Employee.workspace_id == requester.workspace_id,
         )
+    )
+    if requester.role == "manager":
+        query = query.where(Employee.manager_id == requester.id)
     requests = db.scalars(query.order_by(LeaveRequest.id.desc())).all()
     if not requests:
         return {"type": "pending_requests", "reply": "There are no pending leave requests for you."}
@@ -728,6 +750,13 @@ def _handle_chat_approval(text: str, approver: Employee, db: Session) -> dict | 
         "stage": "manager" if request.status == "pending_manager" else "hr",
         "request": LeaveRequestRead.model_validate(request).model_dump(mode="json"),
     }
+
+
+def _employee_by_slack(db: Session, slack_user_id: str, workspace_id: str | None = None) -> Employee | None:
+    query = select(Employee).where(Employee.slack_user_id == slack_user_id)
+    if workspace_id:
+        query = query.where(Employee.workspace_id == workspace_id)
+    return db.scalar(query)
 
 
 def _sync_policy_from_db(db: Session) -> LeavePolicyVersion:

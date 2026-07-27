@@ -58,7 +58,14 @@ def _process_slack_event(db: Session, job: DurableJob, payload: dict) -> None:
     if not user_id or not channel_id or not text:
         return
 
-    result = _process_chat(ChatIn(slack_user_id=user_id, text=text), db)
+    result = _process_chat(
+        ChatIn(
+            slack_user_id=user_id,
+            text=text,
+            workspace_id=slack_payload.get("team_id") or event.get("team"),
+        ),
+        db,
+    )
     _queue_chat_result(db, job, channel_id, result)
     logger.info(
         "Slack event processed",
@@ -80,7 +87,13 @@ def _process_slack_interaction(db: Session, job: DurableJob, payload: dict) -> N
     action_id = action.get("action_id")
     if not user_id:
         raise PermanentJobError("Slack interaction has no user")
-    employee = db.scalar(select(Employee).where(Employee.slack_user_id == user_id))
+    from app.api.routes import _employee_by_slack
+
+    employee = _employee_by_slack(
+        db,
+        user_id,
+        interaction.get("team", {}).get("id"),
+    )
     if employee is None:
         _queue_message(db, f"interaction-reply:{job.id}", user_id, "Your Slack account is not registered.")
         return
@@ -231,7 +244,13 @@ def _decide_agentspan(db: Session, job: DurableJob, payload: dict) -> None:
             f"Your leave request #{request.id} has been {request.status}.",
         )
     elif request.status == "pending_hr":
-        hr_people = db.scalars(select(Employee).where(Employee.role.in_(["hr", "admin"]), Employee.is_active.is_(True))).all()
+        hr_people = db.scalars(
+            select(Employee).where(
+                Employee.role.in_(["hr", "admin"]),
+                Employee.is_active.is_(True),
+                Employee.workspace_id == request.employee.workspace_id,
+            )
+        ).all()
         for hr in hr_people:
             enqueue_job(
                 db,

@@ -480,6 +480,85 @@ def test_document_leave_uploads_before_manager_is_notified(tmp_path, monkeypatch
     assert sent_cards[0][-1] == "https://storage.example/proof.pdf"
 
 
+def test_hr_approval_card_stays_in_employee_workspace(tmp_path, monkeypatch) -> None:
+    _engine, factory = make_session_factory(f"sqlite:///{tmp_path / 'hr-workspace.db'}")
+    sent_cards = []
+    monkeypatch.setattr(
+        "app.services.job_handlers.AgentSpanApprovalWorkflow.decide",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.adapters.slack.RealSlackClient.send_channel_message",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.adapters.slack.RealSlackClient.send_leave_approval",
+        lambda self, *args: sent_cards.append(args),
+    )
+    with factory() as db:
+        manager = Employee(
+            workspace_id="T_TEST",
+            slack_user_id="U_MANAGER",
+            email="manager@example.com",
+            name="Manager",
+            role="manager",
+        )
+        employee = Employee(
+            workspace_id="T_TEST",
+            slack_user_id="U_EMPLOYEE",
+            email="employee@example.com",
+            name="Employee",
+            manager=manager,
+        )
+        hr = Employee(
+            workspace_id="T_TEST",
+            slack_user_id="U_HR",
+            email="hr@example.com",
+            name="HR",
+            role="hr",
+        )
+        outside_hr = Employee(
+            workspace_id="T_OTHER",
+            slack_user_id="U_OTHER_HR",
+            email="other-hr@example.com",
+            name="Other HR",
+            role="hr",
+        )
+        db.add_all([manager, employee, hr, outside_hr])
+        db.flush()
+        request = LeaveRequest(
+            employee_id=employee.id,
+            leave_type="maternity",
+            start_date=date.today() + timedelta(days=5),
+            end_date=date.today() + timedelta(days=6),
+            days_requested=2,
+            document_key="https://storage.example/proof.pdf",
+            status="pending_manager",
+            agentspan_execution_id="workflow-hr",
+        )
+        db.add(request)
+        db.flush()
+        enqueue_job(
+            db,
+            "decide_agentspan",
+            "manager-approves-for-hr",
+            {
+                "leave_request_id": request.id,
+                "approver_id": manager.id,
+                "approved": True,
+                "stage": "manager",
+                "reply_channel": manager.slack_user_id,
+            },
+        )
+        db.commit()
+
+    worker = DurableJobWorker(factory, retry_base_seconds=0)
+    while worker.run_once():
+        pass
+
+    assert [card[0] for card in sent_cards] == ["U_HR"]
+
+
 def test_duplicate_approval_jobs_record_one_decision(tmp_path, monkeypatch) -> None:
     _engine, factory = make_session_factory(f"sqlite:///{tmp_path / 'approval.db'}")
     decisions = []

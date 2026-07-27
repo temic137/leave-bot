@@ -11,6 +11,7 @@ class SlackUser:
     email: str
     name: str
     is_active: bool = True
+    workspace_id: str | None = None
 
 
 class SlackClient:
@@ -242,6 +243,7 @@ class RealSlackClient(SlackClient):
 
     def list_users(self) -> list[SlackUser]:
         data = self._api("users.list", {})
+        workspace_id = self._api("auth.test", {}).get("team_id")
         users = []
         for member in data.get("members", []):
             profile = member.get("profile", {})
@@ -254,6 +256,7 @@ class RealSlackClient(SlackClient):
                     email=email,
                     name=profile.get("real_name") or member.get("real_name") or member.get("name") or email,
                     is_active=not member.get("deleted", False),
+                    workspace_id=workspace_id,
                 )
             )
         return users

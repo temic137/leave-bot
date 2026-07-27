@@ -456,3 +456,32 @@ def test_hr_can_view_all_pending_requests(db: Session) -> None:
 
     assert result["type"] == "pending_requests"
     assert f"#{request.id} | Employee | annual" in result["reply"]
+
+
+def test_hr_views_are_limited_to_their_workspace(db: Session) -> None:
+    employee, _manager, hr = seed_people(db)
+    employee.workspace_id = hr.workspace_id = "T_TEST"
+    outsider = Employee(
+        workspace_id="T_OTHER",
+        slack_user_id="U_OUTSIDER",
+        email="outsider@example.com",
+        name="Outside Employee",
+    )
+    db.add(outsider)
+    db.flush()
+    outside_request = LeaveRequest(
+        employee_id=outsider.id,
+        leave_type="annual",
+        start_date=date.today(),
+        end_date=date.today(),
+        days_requested=1,
+        status=LeaveRequestStatus.pending_hr.value,
+    )
+    db.add(outside_request)
+    db.flush()
+
+    balances = routes._balance_result_for_query(db, hr, "show all employee balances")
+    pending = routes._pending_requests_result(db, hr)
+
+    assert "Outside Employee" not in balances["reply"]
+    assert f"#{outside_request.id}" not in pending["reply"]
