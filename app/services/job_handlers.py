@@ -8,9 +8,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.adapters.slack import RealSlackClient
+from app.adapters.performance import PerformanceAPIClient
 from app.adapters.storage import AutochekDocumentStorage
 from app.adapters.workflow import AgentSpanApprovalWorkflow
+from app.core.config import settings
 from app.db.models import DurableJob, Employee, LeaveRequest, LeaveRequestStatus
+from app.services.balances import BalanceService
+from app.services.employee_sync import EmployeeSyncService
 from app.services.jobs import PermanentJobError, enqueue_job
 from app.services.leave_requests import LeaveRequestService
 from app.services.permissions import can_approve_request
@@ -25,6 +29,9 @@ def handle_job(db: Session, job: DurableJob) -> None:
         "process_slack_event": _process_slack_event,
         "process_slack_interaction": _process_slack_interaction,
         "start_agentspan": _start_agentspan,
+        "create_external_leave_request": _create_external_leave_request,
+        "update_external_leave_request": _update_external_leave_request,
+        "sync_external_employees": _sync_external_employees,
         "decide_agentspan": _decide_agentspan,
         "send_slack_message": _send_slack_message,
         "send_leave_request_prompt": _send_leave_request_prompt,
@@ -345,6 +352,132 @@ def _start_agentspan(db: Session, job: DurableJob, payload: dict) -> None:
     )
 
 
+def _create_external_leave_request(
+    db: Session,
+    job: DurableJob,
+    payload: dict,
+) -> None:
+    request = db.scalar(
+        select(LeaveRequest)
+        .where(LeaveRequest.id == payload["leave_request_id"])
+        .with_for_update()
+    )
+    if request is None:
+        raise PermanentJobError("Leave request no longer exists")
+    _ensure_external_request(request)
+    db.flush()
+    enqueue_job(
+        db,
+        "start_agentspan",
+        f"agentspan-start:leave-request:{request.id}",
+        {"leave_request_id": request.id},
+    )
+
+
+def _update_external_leave_request(
+    db: Session,
+    job: DurableJob,
+    payload: dict,
+) -> None:
+    request = db.scalar(
+        select(LeaveRequest)
+        .where(LeaveRequest.id == payload["leave_request_id"])
+        .with_for_update()
+    )
+    approver = db.get(Employee, payload["approver_id"])
+    if request is None or approver is None:
+        raise PermanentJobError("Approver or leave request no longer exists")
+    _ensure_external_request(request)
+    PerformanceAPIClient().update_leave_request(
+        request.external_request_id,
+        status=_external_status(request.status),
+        approver_name=approver.name,
+        approver_email=approver.email,
+    )
+
+
+def _sync_external_employees(db: Session, job: DurableJob, payload: dict) -> None:
+    service = EmployeeSyncService(db)
+    for record in PerformanceAPIClient().list_employees():
+        service.upsert_external_employee(record)
+
+
+def _ensure_external_request(request: LeaveRequest) -> None:
+    if request.external_request_id:
+        return
+    if request.employee.manager is None:
+        raise PermanentJobError("Employee has no manager")
+    from app.services.policy import leave_policy
+
+    client = PerformanceAPIClient()
+    rule = leave_policy.get(request.leave_type)
+    balance = client.find_balance(
+        request.employee.email,
+        request.leave_type,
+        rule.display_name,
+    )
+    if balance is None:
+        raise PermanentJobError(
+            f"{request.employee.name} is not eligible for {rule.display_name}"
+        )
+    external_leave_type = str(balance["leavetype"])
+    existing = client.find_request(
+        email=request.employee.email,
+        leave_type=external_leave_type,
+        start_date=request.start_date,
+        end_date=request.end_date,
+    )
+    record = existing or client.create_leave_request(
+        email=request.employee.email,
+        employee_name=request.employee.name,
+        leave_type=external_leave_type,
+        start_date=request.start_date,
+        end_date=request.end_date,
+        status=_external_status(request.status),
+        country=str(balance.get("country") or request.employee.country or ""),
+        approver_name=request.employee.manager.name,
+        approver_email=request.employee.manager.email,
+    )
+    if not record.get("id"):
+        raise RuntimeError("Performance API did not return a leave request ID")
+    request.external_request_id = str(record["id"])
+    request.external_leave_type = external_leave_type
+
+
+def _external_status(local_status: str) -> str:
+    if local_status == LeaveRequestStatus.approved.value:
+        return "Approved"
+    if local_status in {
+        LeaveRequestStatus.rejected.value,
+        LeaveRequestStatus.cancelled.value,
+    }:
+        return "Declined"
+    return "Pending"
+
+
+def _queue_external_update(
+    db: Session,
+    request: LeaveRequest,
+    approver: Employee,
+) -> None:
+    if settings.performance_api_mode.lower() != "live":
+        return
+    version = (
+        request.decided_at.isoformat()
+        if request.decided_at is not None
+        else request.status
+    )
+    enqueue_job(
+        db,
+        "update_external_leave_request",
+        f"external-request-status:{request.id}:{request.status}:{version}",
+        {
+            "leave_request_id": request.id,
+            "approver_id": approver.id,
+        },
+    )
+
+
 def _decide_agentspan(db: Session, job: DurableJob, payload: dict) -> None:
     request = db.scalar(
         select(LeaveRequest).where(LeaveRequest.id == payload["leave_request_id"]).with_for_update()
@@ -395,6 +528,11 @@ def _decide_agentspan(db: Session, job: DurableJob, payload: dict) -> None:
     else:
         service.record_hr_decision(approver, request, payload["approved"], "Slack decision")
     db.flush()
+    if request.status in {
+        LeaveRequestStatus.approved.value,
+        LeaveRequestStatus.rejected.value,
+    }:
+        _queue_external_update(db, request, approver)
     _queue_leave_card_update(
         db,
         f"approval-card-update:{job.id}",
@@ -515,13 +653,17 @@ def _send_balance_report_csv(db: Session, job: DurableJob, payload: dict) -> Non
         [employee.id for employee in employees],
         year,
     )
+    eligible = balance_service.get_eligible_leave_types_for_employees(
+        [employee.id for employee in employees],
+    )
     output = io.StringIO(newline="")
     writer = csv.writer(output)
     writer.writerow(
         ["employee", "email", "department", "leave_type", "allocated_days", "used_days", "remaining_days", "year"]
     )
     for employee in employees:
-        for leave_type, rule in leave_policy.all().items():
+        for leave_type in sorted(eligible[employee.id]):
+            rule = leave_policy.get(leave_type)
             used = grouped.get(employee.id, {}).get(leave_type, 0.0)
             allocated = allocations[employee.id][leave_type]
             writer.writerow(
@@ -731,6 +873,7 @@ def _cancel_leave_request(db: Session, job: DurableJob, payload: dict) -> None:
             f"{leave_name(request.leave_type)} request."
         )
     else:
+        _queue_external_update(db, request, employee)
         _queue_leave_card_update(
             db,
             f"approval-card-cancelled:{request.id}",
@@ -784,6 +927,7 @@ def _decide_leave_cancellation(db: Session, job: DurableJob, payload: dict) -> N
         payload["approved"],
     )
     db.flush()
+    _queue_external_update(db, request, approver)
     _queue_leave_card_update(
         db,
         f"cancellation-card-update:{job.id}",
@@ -816,14 +960,51 @@ def _adjust_leave_balance(db: Session, job: DurableJob, payload: dict) -> None:
         raise PermanentJobError("Adjuster or employee no longer exists")
     service = BalanceService(db)
     try:
-        service.adjust_allocation(
-            adjuster,
-            employee,
-            payload["leave_type"],
-            int(payload["year"]),
-            float(payload["days_delta"]),
-            payload["reason"],
-        )
+        leave_type = payload["leave_type"]
+        year = int(payload["year"])
+        days_delta = float(payload["days_delta"])
+        if settings.performance_api_mode.lower() == "live":
+            from app.services.policy import leave_policy
+
+            rule = leave_policy.get(leave_type)
+            client = PerformanceAPIClient()
+            balance = client.find_balance(
+                employee.email,
+                leave_type,
+                rule.display_name,
+            )
+            if balance is None:
+                raise ValueError(
+                    f"{employee.name} is not eligible for {rule.display_name}."
+                )
+            target_remaining = float(
+                payload.get(
+                    "external_target_balance",
+                    float(balance.get("balance") or 0) + days_delta,
+                )
+            )
+            if target_remaining < 0 and not rule.allow_negative_balance:
+                raise ValueError(
+                    "This adjustment would make the remaining balance negative."
+                )
+            client.update_balance(str(balance["id"]), target_remaining)
+            service.record_adjustment(
+                adjuster,
+                employee,
+                leave_type,
+                year,
+                days_delta,
+                payload["reason"],
+            )
+        else:
+            service.adjust_allocation(
+                adjuster,
+                employee,
+                leave_type,
+                year,
+                days_delta,
+                payload["reason"],
+            )
     except ValueError as exc:
         _queue_message(
             db,
@@ -897,6 +1078,7 @@ def _override_leave_request(db: Session, job: DurableJob, payload: dict) -> None
             f"HR override: {payload['reason']}",
         )
     db.flush()
+    _queue_external_update(db, request, approver)
     _queue_leave_card_update(
         db,
         f"override-card-update:{job.id}",
@@ -953,7 +1135,11 @@ def _upload_leave_document(db: Session, job: DurableJob, payload: dict) -> None:
     request.status = "pending_manager"
     enqueue_job(
         db,
-        "start_agentspan",
+        (
+            "create_external_leave_request"
+            if settings.performance_api_mode.lower() == "live"
+            else "start_agentspan"
+        ),
         f"agentspan-start:leave-request:{request.id}",
         {"leave_request_id": request.id},
     )

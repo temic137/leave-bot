@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -25,9 +25,24 @@ class LeaveRequestService:
             raise ValueError("Employee does not exist")
         if payload.start_date.year != payload.end_date.year:
             raise ValueError("A leave request cannot cross into another calendar year. Submit one request per year.")
-        days_requested = calculate_leave_days(payload.start_date, payload.end_date)
+        if (
+            rule.min_notice_days
+            and payload.start_date < date.today() + timedelta(days=rule.min_notice_days)
+        ):
+            raise ValueError(
+                f"{rule.display_name} requires at least {rule.min_notice_days} days notice."
+            )
+        days_requested = calculate_leave_days(
+            payload.start_date,
+            payload.end_date,
+            rule.count_weekends,
+        )
         if days_requested == 0:
             raise ValueError("The selected dates do not contain any working days.")
+        if rule.max_request_days is not None and days_requested > rule.max_request_days:
+            raise ValueError(
+                f"{rule.display_name} allows at most {rule.max_request_days:g} days per request."
+            )
 
         if rule.requires_document and not payload.document_key:
             raise ValueError("This leave type requires a document")

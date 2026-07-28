@@ -13,6 +13,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.adapters.slack import RealSlackClient
+from app.adapters.performance import PerformanceAPIClient, PerformanceAPIError
 from app.core.config import settings
 from app.db.models import DurableJob, Employee, LeavePolicyVersion, LeaveRequest, LeaveRequestStatus
 from app.db.session import get_db
@@ -44,6 +45,9 @@ class LeavePolicyIn(BaseModel):
     requires_document: bool = False
     requires_hr: bool = False
     allow_negative_balance: bool = False
+    min_notice_days: int = 0
+    max_request_days: float | None = None
+    count_weekends: bool = False
 
 
 class PolicyTextIn(BaseModel):
@@ -64,6 +68,8 @@ class EmployeeIn(BaseModel):
     department: str | None = None
     manager_id: int | None = None
     workspace_id: str | None = None
+    external_employee_id: str | None = None
+    country: str | None = None
 
 
 @router.post("/admin/init-db")
@@ -89,6 +95,41 @@ def sync_real_slack(db: Session = Depends(get_db)) -> dict[str, int]:
     return {"users_upserted": count}
 
 
+@router.post("/admin/sync/performance-employees")
+def sync_performance_employees(db: Session = Depends(get_db)) -> dict[str, int]:
+    client = PerformanceAPIClient()
+    service = EmployeeSyncService(db)
+    count = 0
+    for record in client.list_employees():
+        service.upsert_external_employee(record)
+        count += 1
+    db.commit()
+    return {"users_upserted": count}
+
+
+@router.get("/admin/performance-status")
+def performance_status() -> dict:
+    client = PerformanceAPIClient()
+    result = {
+        "mode": settings.performance_api_mode,
+        "configured": client.configured,
+    }
+    if not client.configured:
+        return result
+    try:
+        result.update(
+            {
+                "reachable": True,
+                "employees": len(client.list_employees()),
+                "balances": len(client.list_balances()),
+                "requests": len(client.list_requests()),
+            }
+        )
+    except PerformanceAPIError as exc:
+        result.update({"reachable": False, "error": str(exc)})
+    return result
+
+
 @router.get("/admin/slack-users")
 def list_real_slack_users() -> list[dict]:
     return RealSlackClient().list_user_directory()
@@ -102,11 +143,13 @@ def create_employee(payload: EmployeeIn, db: Session = Depends(get_db)) -> dict:
     if existing is None:
         employee = Employee(
             workspace_id=payload.workspace_id,
+            external_employee_id=payload.external_employee_id,
             slack_user_id=payload.slack_user_id,
             email=payload.email,
             name=payload.name,
             role=payload.role,
             department=payload.department,
+            country=payload.country,
             manager_id=payload.manager_id,
         )
         db.add(employee)
@@ -117,6 +160,10 @@ def create_employee(payload: EmployeeIn, db: Session = Depends(get_db)) -> dict:
         employee.role = payload.role
         employee.department = payload.department
         employee.manager_id = payload.manager_id
+        employee.external_employee_id = (
+            payload.external_employee_id or employee.external_employee_id
+        )
+        employee.country = payload.country or employee.country
         if payload.workspace_id:
             employee.workspace_id = payload.workspace_id
     db.flush()
@@ -125,11 +172,13 @@ def create_employee(payload: EmployeeIn, db: Session = Depends(get_db)) -> dict:
     return {
         "id": employee.id,
         "workspace_id": employee.workspace_id,
+        "external_employee_id": employee.external_employee_id,
         "slack_user_id": employee.slack_user_id,
         "email": employee.email,
         "name": employee.name,
         "role": employee.role,
         "department": employee.department,
+        "country": employee.country,
         "manager_id": employee.manager_id,
     }
 
@@ -145,6 +194,9 @@ def list_leave_types(db: Session = Depends(get_db)) -> dict:
             "requires_document": value.requires_document,
             "requires_hr": value.requires_hr,
             "allow_negative_balance": value.allow_negative_balance,
+            "min_notice_days": value.min_notice_days,
+            "max_request_days": value.max_request_days,
+            "count_weekends": value.count_weekends,
         }
         for key, value in leave_policy.all().items()
     }
@@ -161,6 +213,9 @@ def upsert_leave_type(payload: LeavePolicyIn, db: Session = Depends(get_db)) -> 
             requires_document=payload.requires_document,
             requires_hr=payload.requires_hr,
             allow_negative_balance=payload.allow_negative_balance,
+            min_notice_days=payload.min_notice_days,
+            max_request_days=payload.max_request_days,
+            count_weekends=payload.count_weekends,
             persist=False,
         )
     except ValueError as exc:
@@ -182,6 +237,9 @@ def upsert_leave_type(payload: LeavePolicyIn, db: Session = Depends(get_db)) -> 
         "requires_document": rule.requires_document,
         "requires_hr": rule.requires_hr,
         "allow_negative_balance": rule.allow_negative_balance,
+        "min_notice_days": rule.min_notice_days,
+        "max_request_days": rule.max_request_days,
+        "count_weekends": rule.count_weekends,
     }
 
 
@@ -246,11 +304,13 @@ def admin_state(db: Session = Depends(get_db)) -> dict:
             {
                 "id": employee.id,
                 "workspace_id": employee.workspace_id,
+                "external_employee_id": employee.external_employee_id,
                 "slack_user_id": employee.slack_user_id,
                 "name": employee.name,
                 "email": employee.email,
                 "role": employee.role,
                 "department": employee.department,
+                "country": employee.country,
                 "manager_id": employee.manager_id,
                 "manager_name": employee.manager.name if employee.manager else None,
                 "balances": {
@@ -270,6 +330,8 @@ def admin_state(db: Session = Depends(get_db)) -> dict:
         "requests": [
             {
                 "id": request.id,
+                "external_request_id": request.external_request_id,
+                "external_leave_type": request.external_leave_type,
                 "employee_id": request.employee_id,
                 "employee_name": request.employee.name,
                 "leave_type": request.leave_type,
@@ -290,6 +352,9 @@ def admin_state(db: Session = Depends(get_db)) -> dict:
                 "requires_document": value.requires_document,
                 "requires_hr": value.requires_hr,
                 "allow_negative_balance": value.allow_negative_balance,
+                "min_notice_days": value.min_notice_days,
+                "max_request_days": value.max_request_days,
+                "count_weekends": value.count_weekends,
             }
             for key, value in leave_policy.all().items()
         },
@@ -617,6 +682,30 @@ def _submit_balance_adjustment(payload: dict, db: Session) -> dict:
         errors["reason"] = "Enter a reason for this adjustment."
     if errors:
         return _modal_errors(errors)
+    external_target_balance = None
+    if settings.performance_api_mode.lower() == "live":
+        rule = leave_policy.get(leave_type)
+        try:
+            balance = PerformanceAPIClient().find_balance(
+                target.email,
+                leave_type,
+                rule.display_name,
+            )
+        except PerformanceAPIError as exc:
+            return _modal_errors({"employee": str(exc)})
+        if balance is None:
+            return _modal_errors(
+                {
+                    "employee": (
+                        f"{target.name} is not eligible for {rule.display_name}."
+                    )
+                }
+            )
+        external_target_balance = float(balance.get("balance") or 0) + days_delta
+        if external_target_balance < 0 and not rule.allow_negative_balance:
+            return _modal_errors(
+                {"days": "This adjustment would make the remaining balance negative."}
+            )
     enqueue_job(
         db,
         "adjust_leave_balance",
@@ -629,6 +718,7 @@ def _submit_balance_adjustment(payload: dict, db: Session) -> dict:
             "days_delta": days_delta,
             "reason": reason.strip(),
             "reply_channel": requester.slack_user_id,
+            "external_target_balance": external_target_balance,
         },
     )
     db.commit()
@@ -793,7 +883,7 @@ def _submit_leave_modal(payload: dict, db: Session) -> dict:
                 document_key=f"slack:{document_id}" if document_id else None,
             )
         )
-    except ValueError as exc:
+    except (ValueError, PerformanceAPIError) as exc:
         message = str(exc)
         field = "start_date" if "overlap" in message.lower() or "working days" in message.lower() else "leave_type"
         return _modal_errors({field: message})
@@ -810,7 +900,11 @@ def _submit_leave_modal(payload: dict, db: Session) -> dict:
     else:
         enqueue_job(
             db,
-            "start_agentspan",
+            (
+                "create_external_leave_request"
+                if settings.performance_api_mode.lower() == "live"
+                else "start_agentspan"
+            ),
             job_key,
             {"leave_request_id": leave_request.id},
         )
@@ -825,7 +919,11 @@ def _submit_leave_modal(payload: dict, db: Session) -> dict:
                 + (
                     "I am processing the supporting document before notifying your manager."
                     if document_id
-                    else f"It was sent to {employee.manager.name} for approval."
+                    else (
+                        "I am registering it in the leave system before notifying your manager."
+                        if settings.performance_api_mode.lower() == "live"
+                        else f"It was sent to {employee.manager.name} for approval."
+                    )
                 )
             ),
         },
@@ -998,11 +1096,33 @@ def _format_compact_balance(
 
 
 def _balance_result(db: Session, employee: Employee) -> dict:
-    balances = _taken_balances(db, employee)
-    allocations = BalanceService(db).get_allocated_days_for_employees(
+    service = BalanceService(db)
+    eligible = service.get_eligible_leave_types_for_employees([employee.id])[
+        employee.id
+    ]
+    grouped = service.get_taken_days_for_employees(
+        [employee.id],
+        date.today().year,
+    )
+    balances = {
+        leave_type: grouped.get(employee.id, {}).get(leave_type, 0.0)
+        for leave_type in sorted(eligible)
+    }
+    allocations = service.get_allocated_days_for_employees(
         [employee.id],
         date.today().year,
     )[employee.id]
+    allocations = {
+        leave_type: allocations[leave_type]
+        for leave_type in sorted(eligible)
+    }
+    if not eligible:
+        return {
+            "type": "balance",
+            "reply": f"No leave balances were found for {employee.name}.",
+            "balances": {},
+            "allocations": {},
+        }
     return {
         "type": "balance",
         "reply": _format_balance_reply(employee, balances, allocations),
@@ -1103,14 +1223,20 @@ def _balance_report_page_result(
         [employee.id for employee in employees],
         date.today().year,
     )
+    eligible = BalanceService(db).get_eligible_leave_types_for_employees(
+        [employee.id for employee in employees],
+    )
     rows = [
         _format_compact_balance(
             employee,
             {
                 leave_type: grouped.get(employee.id, {}).get(leave_type, 0.0)
-                for leave_type in leave_policy.all()
+                for leave_type in sorted(eligible[employee.id])
             },
-            allocations[employee.id],
+            {
+                leave_type: allocations[employee.id][leave_type]
+                for leave_type in sorted(eligible[employee.id])
+            },
         )
         for employee in employees
     ]

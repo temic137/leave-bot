@@ -78,10 +78,17 @@ AUTOCHEK_UPLOAD_URL=https://api.staging.myautochek.com/document/upload
 AUTOCHEK_API_TOKEN=your-autochek-token
 AUTOCHEK_API_KEY=your-autochek-api-key
 DOCUMENT_MAX_BYTES=900000
+PERFORMANCE_API_URL=https://performance.autochek.africa
+PERFORMANCE_API_TOKEN=your-performance-api-token
+PERFORMANCE_API_MODE=shadow
 INTENT_MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2
 INTENT_CONFIDENCE_THRESHOLD=0.45
 INTENT_MARGIN_THRESHOLD=0.05
 ```
+
+Use `shadow` while checking employee synchronization and API access. Change it
+to `live` only after the real balance and request tables are populated. Live
+mode does not silently fall back to PostgreSQL when the Performance API fails.
 
 Leave these blank for now unless needed:
 

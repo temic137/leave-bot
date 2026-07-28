@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     autochek_api_key: str = ""
     autochek_alt_app: str = "marketplace_web_app"
     document_max_bytes: int = 900_000
+    performance_api_url: str = ""
+    performance_api_token: str = ""
+    performance_api_mode: str = "disabled"
+    performance_api_timeout_seconds: float = 10
 
     intent_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     intent_examples_path: str = "config/intent_examples.json"

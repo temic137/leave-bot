@@ -65,13 +65,21 @@ def liveness() -> dict[str, str]:
 def readiness() -> dict:
     missing = []
     if settings.app_env == "production":
+        required = [
+            ("SLACK_BOT_TOKEN", settings.slack_bot_token),
+            ("SLACK_SIGNING_SECRET", settings.slack_signing_secret),
+            ("AGENTSPAN_SERVER_URL", settings.agentspan_server_url),
+        ]
+        if settings.performance_api_mode.lower() == "live":
+            required.extend(
+                [
+                    ("PERFORMANCE_API_URL", settings.performance_api_url),
+                    ("PERFORMANCE_API_TOKEN", settings.performance_api_token),
+                ]
+            )
         missing = [
             name
-            for name, value in (
-                ("SLACK_BOT_TOKEN", settings.slack_bot_token),
-                ("SLACK_SIGNING_SECRET", settings.slack_signing_secret),
-                ("AGENTSPAN_SERVER_URL", settings.agentspan_server_url),
-            )
+            for name, value in required
             if not value
         ]
     try:
@@ -98,6 +106,10 @@ def dependency_status() -> dict:
         "agentspan_configured": bool(settings.agentspan_server_url),
         "slack_configured": bool(settings.slack_bot_token),
         "document_upload_configured": bool(settings.autochek_upload_url),
+        "performance_api_mode": settings.performance_api_mode,
+        "performance_api_configured": bool(
+            settings.performance_api_url and settings.performance_api_token
+        ),
     }
 
 

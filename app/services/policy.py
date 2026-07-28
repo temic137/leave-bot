@@ -14,6 +14,9 @@ class LeaveTypePolicy:
     requires_document: bool
     requires_hr: bool
     allow_negative_balance: bool
+    min_notice_days: int = 0
+    max_request_days: float | None = None
+    count_weekends: bool = False
 
 
 class LeavePolicy:
@@ -34,6 +37,13 @@ class LeavePolicy:
                 requires_document=bool(value["requires_document"]),
                 requires_hr=bool(value["requires_hr"]),
                 allow_negative_balance=bool(value["allow_negative_balance"]),
+                min_notice_days=int(value.get("min_notice_days", 0)),
+                max_request_days=(
+                    float(value["max_request_days"])
+                    if value.get("max_request_days") is not None
+                    else None
+                ),
+                count_weekends=bool(value.get("count_weekends", False)),
             )
             for key, value in raw.items()
         }
@@ -58,11 +68,18 @@ class LeavePolicy:
         requires_document: bool,
         requires_hr: bool,
         allow_negative_balance: bool,
+        min_notice_days: int = 0,
+        max_request_days: float | None = None,
+        count_weekends: bool = False,
         persist: bool = True,
     ) -> LeaveTypePolicy:
         normalized_key = self._normalize_key(key)
         if annual_days < 0:
             raise ValueError("annual_days cannot be negative")
+        if min_notice_days < 0:
+            raise ValueError("min_notice_days cannot be negative")
+        if max_request_days is not None and max_request_days <= 0:
+            raise ValueError("max_request_days must be positive")
 
         raw = self.to_raw()
         raw[normalized_key] = {
@@ -71,6 +88,9 @@ class LeavePolicy:
             "requires_document": requires_document,
             "requires_hr": requires_hr,
             "allow_negative_balance": allow_negative_balance,
+            "min_notice_days": min_notice_days,
+            "max_request_days": max_request_days,
+            "count_weekends": count_weekends,
         }
         if persist:
             self.path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
@@ -96,6 +116,9 @@ class LeavePolicy:
                 "requires_document": rule.requires_document,
                 "requires_hr": rule.requires_hr,
                 "allow_negative_balance": rule.allow_negative_balance,
+                "min_notice_days": rule.min_notice_days,
+                "max_request_days": rule.max_request_days,
+                "count_weekends": rule.count_weekends,
             }
             for key, rule in self._rules.items()
         }
@@ -106,7 +129,17 @@ class LeavePolicy:
             document = "Document required" if rule.requires_document else "No document required"
             approval = "HR approval required" if rule.requires_hr else "Manager approval only"
             negative = "Negative balance allowed" if rule.allow_negative_balance else "Negative balance not allowed"
-            lines.append(f"{rule.display_name}: {rule.annual_days:g} days maximum. {document}. {approval}. {negative}.")
+            notice = f" {rule.min_notice_days} days notice." if rule.min_notice_days else ""
+            request_limit = (
+                f" {rule.max_request_days:g} days maximum per request."
+                if rule.max_request_days is not None
+                else ""
+            )
+            weekends = " Weekends counted." if rule.count_weekends else " Weekends excluded."
+            lines.append(
+                f"{rule.display_name}: {rule.annual_days:g} days maximum. "
+                f"{document}. {approval}. {negative}.{notice}{request_limit}{weekends}"
+            )
         return "\n".join(lines) + "\n"
 
     def _normalize_key(self, key: str) -> str:
@@ -138,6 +171,9 @@ class LeavePolicy:
                 "requires_document": self._extract_requires_document(normalized),
                 "requires_hr": self._extract_requires_hr(normalized),
                 "allow_negative_balance": self._extract_allow_negative(normalized),
+                "min_notice_days": self._extract_notice_days(normalized),
+                "max_request_days": self._extract_request_limit(normalized),
+                "count_weekends": self._extract_count_weekends(normalized),
             }
         if not raw:
             raise ValueError("Policy text must contain at least one leave type")
@@ -181,6 +217,26 @@ class LeavePolicy:
         if any(phrase in text for phrase in ("negative balance not allowed", "no negative", "cannot go negative")):
             return False
         return "negative" in text and any(phrase in text for phrase in ("allowed", "allow", "can go"))
+
+    def _extract_notice_days(self, text: str) -> int:
+        match = re.search(r"(\d+)\s+days?\s+(?:advance\s+)?notice", text)
+        return int(match.group(1)) if match else 0
+
+    def _extract_request_limit(self, text: str) -> float | None:
+        patterns = (
+            r"(\d+(?:\.\d+)?)\s+days?\s+maximum\s+per\s+request",
+            r"maximum\s+(?:of\s+)?(\d+(?:\.\d+)?)\s+days?\s+per\s+request",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return float(match.group(1))
+        return None
+
+    def _extract_count_weekends(self, text: str) -> bool:
+        if any(phrase in text for phrase in ("weekends excluded", "exclude weekends", "working days only")):
+            return False
+        return any(phrase in text for phrase in ("weekends counted", "include weekends", "calendar days"))
 
 
 leave_policy = LeavePolicy()

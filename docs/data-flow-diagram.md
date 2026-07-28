@@ -19,7 +19,11 @@ Employee or Manager
         |        Chooses a fixed action from a normal Slack message
         |
         +------> Leave Database
-        |        Saves employees, requests, policies, and decisions
+        |        Saves Slack links, approvals, policies, jobs, and audit history
+        |
+        +------> Performance API
+        |        Supplies eligibility and current balances
+        |        Receives new requests and status changes
         |
         +------> AgentSpan
         |        Keeps track of the approval steps
@@ -162,34 +166,27 @@ removed so the same decision cannot be clicked again.
 If the manager clicks **Reject**, the request becomes rejected and the employee
 is told in Slack.
 
-## 4. Checking Days Taken
+## 4. Checking Leave Balance
 
-The bot shows how many approved leave days an employee has taken. It does not
-show allocated or remaining days.
+In live mode, a row in the balance API means the employee is eligible for that
+leave type. Its `balance` value is the employee's current remaining days.
 
 ```text
 Employee: Show my leave balance.
                     |
                     v
-The API finds all approved leave requests for that employee.
+The API reads the employee's current balance rows.
                     |
                     v
-The API adds the days together for each leave type.
+The API adds approved request days to calculate days used.
                     |
                     v
-The bot sends the totals back in Slack.
+The bot shows allocated, used, and remaining days.
 ```
 
-Example reply:
-
-```text
-Annual: 4 days taken
-Sick: 2 days taken
-Emergency: 0 days taken
-```
-
-There is no separate balance table. The total comes directly from approved
-leave requests, so the answer cannot disagree with the request history.
+For example, an API balance of 14 with 6 approved days is displayed as 20
+allocated, 6 used, and 14 remaining. Pending requests reserve days while they
+wait for a decision.
 
 ## 5. Employees And Managers
 
@@ -244,6 +241,8 @@ Old versions are kept so changes can be checked later.
 employees
   - Who the person is
   - Their Slack ID
+  - Their external employee ID
+  - Their country
   - Their role
   - Who their manager is
        |
@@ -254,6 +253,7 @@ leave_requests
   - Start and end dates
   - Number of days
   - Current status
+  - External request ID and leave type
   - Slack messages that need to be updated
        |
        | one request can have many decisions
@@ -375,7 +375,8 @@ Working now:
 - manager approval buttons;
 - HR approval steps;
 - policy editing and policy history;
-- days-taken totals;
+- external employee, balance, and leave-request integration;
+- allocated, used, and remaining balance totals;
 - database storage, retries, and restart recovery; and
 - AgentSpan approval tracking.
 

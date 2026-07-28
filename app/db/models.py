@@ -39,11 +39,13 @@ class Employee(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     workspace_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    external_employee_id: Mapped[str | None] = mapped_column(String(64), index=True)
     slack_user_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(32), default=EmployeeRole.employee.value)
     department: Mapped[str | None] = mapped_column(String(128))
+    country: Mapped[str | None] = mapped_column(String(64))
     manager_id: Mapped[int | None] = mapped_column(ForeignKey("employees.id"))
     is_active: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
@@ -57,6 +59,8 @@ class LeaveRequest(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id"), index=True)
+    external_request_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    external_leave_type: Mapped[str | None] = mapped_column(String(128))
     leave_type: Mapped[str] = mapped_column(String(64), index=True)
     start_date: Mapped[datetime] = mapped_column(Date)
     end_date: Mapped[datetime] = mapped_column(Date)

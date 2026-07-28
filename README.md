@@ -4,9 +4,9 @@ This is the foundation for a structured Slack leave bot.
 
 Current scope:
 
-- Slack workspace sync is the employee source.
-- Manager relationships come from an admin CSV.
-- Leave/document rules are placeholders in JSON config.
+- Slack and the Performance API can be synchronized into the employee directory.
+- Manager relationships remain locally managed because the external manager links are not usable.
+- Admins edit supplementary leave rules as plain text with version history.
 - Slack events are acknowledged after they are durably queued in PostgreSQL.
 - FastEmbed routes normal employee messages to fixed actions without generating text.
 - Slack commands and modals collect request data, AgentSpan owns approval workflow checkpoints, and PostgreSQL owns business data.
@@ -19,8 +19,8 @@ Current scope:
 Slack DM -> FastEmbed intent -> explained Slack button/menu
                                       |
 Slack commands/modals -> API -> PostgreSQL durable_jobs -> worker -> AgentSpan
-                                  |                          |
-                                  +-> business tables        +-> Slack replies/cards
+                                  |                          +-> Performance API
+                                  +-> local audit data       +-> Slack replies/cards
 ```
 
 ## Local Setup
@@ -51,6 +51,9 @@ SLACK_SIGNING_SECRET=<Slack signing secret>
 AUTOCHEK_UPLOAD_URL=https://api.staging.myautochek.com/document/upload
 AUTOCHEK_API_TOKEN=<Autochek bearer token>
 AUTOCHEK_API_KEY=<Autochek API key>
+PERFORMANCE_API_URL=https://performance.autochek.africa
+PERFORMANCE_API_TOKEN=<temporary-or-service-bearer-token>
+PERFORMANCE_API_MODE=shadow
 ```
 
 Production requests to `/admin/*` and `/prototype/*` must include the
@@ -65,9 +68,10 @@ use `/slack/interactions`, and events remain available at `/slack/events`.
 4. FastEmbed selects a fixed action; requesting leave produces an explained button.
 5. The button or command opens the Slack modal.
 6. API validates the structured fields, policy, permissions, and document requirement.
-7. A durable job uploads any document, then starts AgentSpan and notifies the manager.
-8. Manager/HR decisions are processed idempotently through durable jobs.
-9. Approved requests are summed to report days taken.
+7. In live mode, a durable job checks the external balance and creates the external request.
+8. A durable job uploads any document, then starts AgentSpan and notifies the manager.
+9. Manager/HR decisions are processed idempotently and mirrored externally.
+10. The external balance is treated as remaining days; approved requests provide used days.
 
 ## Slack Scopes To Request
 
