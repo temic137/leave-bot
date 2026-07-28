@@ -9,7 +9,7 @@ from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.adapters.slack import RealSlackClient
@@ -482,7 +482,12 @@ def _employee_balance_options(payload: dict, db: Session) -> dict:
     search = payload.get("value", "").strip()
     query = _visible_employee_query(requester).order_by(Employee.name).limit(100)
     if search:
-        query = query.where(Employee.name.ilike(f"%{search}%"))
+        query = query.where(
+            or_(
+                Employee.name.ilike(f"%{search}%"),
+                Employee.email.ilike(f"%{search}%"),
+            )
+        )
     employees = db.scalars(query).all()
     return {
         "options": [

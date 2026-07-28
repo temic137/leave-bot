@@ -6,7 +6,7 @@ import time
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api import routes
@@ -32,7 +32,7 @@ from app.services.leave_requests import LeaveRequestService
 from app.services.intents import IntentRouter
 from app.services import job_handlers
 from app.services.permissions import can_approve_request, can_view_balance
-from app.services.policy import LeavePolicy
+from app.services.policy import LeavePolicy, leave_policy
 
 
 @pytest.fixture()
@@ -724,6 +724,48 @@ def test_employee_balance_search_is_workspace_scoped(db: Session) -> None:
 
     assert [option["text"]["text"] for option in result["options"]] == ["Ada Teammate"]
 
+    email_result = routes._employee_balance_options(
+        {
+            "action_id": "balance_employee_search",
+            "user": {"id": hr.slack_user_id},
+            "team": {"id": "T_TEST"},
+            "value": "ada@example.com",
+        },
+        db,
+    )
+    assert [option["text"]["text"] for option in email_result["options"]] == ["Ada Teammate"]
+
+    initial_result = routes._employee_balance_options(
+        {
+            "action_id": "balance_employee_search",
+            "user": {"id": hr.slack_user_id},
+            "team": {"id": "T_TEST"},
+            "value": "",
+        },
+        db,
+    )
+    assert "Ada Teammate" in [option["text"]["text"] for option in initial_result["options"]]
+    assert "Ada Outsider" not in [option["text"]["text"] for option in initial_result["options"]]
+
+
+def test_hr_employee_selectors_show_results_without_typing(monkeypatch) -> None:
+    views = []
+    client = RealSlackClient(token="test-token")
+    monkeypatch.setattr(
+        client,
+        "_api",
+        lambda method, payload: views.append(payload["view"]) or {"ok": True},
+    )
+
+    client.open_employee_balance_search_modal("trigger-search")
+    client.open_balance_adjustment_modal("trigger-adjust", {"annual": leave_policy.get("annual")})
+
+    selectors = [
+        view["blocks"][0]["element"]
+        for view in views
+    ]
+    assert all(selector["min_query_length"] == 0 for selector in selectors)
+
 
 def test_csv_report_contains_only_authorized_employees(db: Session, monkeypatch) -> None:
     employee, _manager, hr = seed_people(db)
@@ -920,6 +962,110 @@ def test_hr_message_exposes_balance_and_override_controls(db: Session, monkeypat
     assert result["can_manage"] is True
     assert "Adjust balance" in result["reply"]
     assert "Override request" in result["reply"]
+
+
+def test_hr_adjustment_and_override_modals_run_through_jobs(
+    db: Session,
+    monkeypatch,
+) -> None:
+    employee, _manager, hr = seed_people(db)
+    employee.workspace_id = hr.workspace_id = "T_TEST"
+    request = LeaveRequest(
+        employee_id=employee.id,
+        leave_type="annual",
+        start_date=date(2026, 9, 7),
+        end_date=date(2026, 9, 8),
+        days_requested=2,
+        status=LeaveRequestStatus.rejected.value,
+    )
+    db.add(request)
+    db.flush()
+    monkeypatch.setattr(routes, "_sync_policy_from_db", lambda session: None)
+
+    adjustment_result = routes._submit_balance_adjustment(
+        {
+            "user": {"id": hr.slack_user_id},
+            "team": {"id": "T_TEST"},
+            "view": {
+                "id": "V_ADJUST",
+                "state": {
+                    "values": {
+                        "employee": {
+                            "balance_employee_search": {
+                                "selected_option": {"value": str(employee.id)}
+                            }
+                        },
+                        "leave_type": {
+                            "adjustment_leave_type": {
+                                "selected_option": {"value": "annual"}
+                            }
+                        },
+                        "days": {"adjustment_days": {"value": "2"}},
+                        "reason": {
+                            "adjustment_reason": {"value": "Contract correction"}
+                        },
+                    }
+                },
+            },
+        },
+        db,
+    )
+    assert adjustment_result == {"response_action": "clear"}
+    adjustment_job = db.scalar(
+        select(DurableJob).where(DurableJob.job_type == "adjust_leave_balance")
+    )
+    job_handlers._adjust_leave_balance(
+        db,
+        adjustment_job,
+        json.loads(adjustment_job.payload_json),
+    )
+    assert BalanceService(db).get_allocated_days(employee.id, "annual", 2026) == 22
+
+    override_result = routes._submit_request_override(
+        {
+            "user": {"id": hr.slack_user_id},
+            "team": {"id": "T_TEST"},
+            "view": {
+                "id": "V_OVERRIDE",
+                "state": {
+                    "values": {
+                        "request": {
+                            "override_request_search": {
+                                "selected_option": {"value": str(request.id)}
+                            }
+                        },
+                        "status": {
+                            "override_status": {
+                                "selected_option": {"value": "approved"}
+                            }
+                        },
+                        "reason": {
+                            "override_reason": {"value": "Reviewed by HR"}
+                        },
+                    }
+                },
+            },
+        },
+        db,
+    )
+    assert override_result == {"response_action": "clear"}
+    override_job = db.scalar(
+        select(DurableJob).where(DurableJob.job_type == "override_leave_request")
+    )
+    job_handlers._override_leave_request(
+        db,
+        override_job,
+        json.loads(override_job.payload_json),
+    )
+    assert request.status == LeaveRequestStatus.approved.value
+    assert db.scalar(
+        select(func.count())
+        .select_from(ApprovalEvent)
+        .where(
+            ApprovalEvent.leave_request_id == request.id,
+            ApprovalEvent.decision == "override_approved",
+        )
+    ) == 1
 
 
 def test_hr_override_is_workspace_scoped_and_audited(db: Session) -> None:

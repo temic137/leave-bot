@@ -148,8 +148,8 @@ class RealSlackClient(SlackClient):
                             "element": {
                                 "type": "external_select",
                                 "action_id": "balance_employee_search",
-                                "min_query_length": 1,
-                                "placeholder": {"type": "plain_text", "text": "Type an employee name"},
+                                "min_query_length": 0,
+                                "placeholder": {"type": "plain_text", "text": "Select or search employee"},
                             },
                         }
                     ],
@@ -210,8 +210,8 @@ class RealSlackClient(SlackClient):
                             "element": {
                                 "type": "external_select",
                                 "action_id": "balance_employee_search",
-                                "min_query_length": 1,
-                                "placeholder": {"type": "plain_text", "text": "Type an employee name"},
+                                "min_query_length": 0,
+                                "placeholder": {"type": "plain_text", "text": "Select or search employee"},
                             },
                         },
                         {
