@@ -444,6 +444,8 @@ def test_document_leave_uploads_before_manager_is_notified(tmp_path, monkeypatch
         db.add_all([manager, employee])
         db.flush()
         start_date = date.today() + timedelta(days=7)
+        while start_date.weekday() >= 5:
+            start_date += timedelta(days=1)
         submission = {
             "type": "view_submission",
             "user": {"id": "U_EMPLOYEE"},
